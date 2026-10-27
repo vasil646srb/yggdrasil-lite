@@ -1,0 +1,72 @@
+//! yggdrasil-lite: Minimal Yggdrasil node for embedded devices.
+//!
+//! This crate implements a subset of the Yggdrasil/Ironwood protocol sufficient
+//! to operate as a leaf node: connecting to 2-3 peers, participating in the
+//! spanning tree, and exchanging encrypted packets with any node in the network.
+//!
+//! With the `transit` feature the node additionally acts as a router: it
+//! merges peer bloom filters into its advertisements, forwards path
+//! discovery messages, and forwards traffic between peers. Individual peers
+//! can be excluded from redistribution with
+//! [`YggdrasilLite::set_peer_no_redistribute`] — marking every peer turns a
+//! transit build into a pure stub (multi-homed, but never carrying third-party
+//! traffic).
+//!
+//! Designed for `no_std` + `alloc` environments (ESP32-C6 with Embassy).
+//!
+//! # Usage
+//!
+//! ```rust,ignore
+//! use yggdrasil_lite::{YggdrasilLite, LiteConfig};
+//!
+//! let config = LiteConfig::new(my_ed25519_seed);
+//! let mut node = YggdrasilLite::new(config);
+//!
+//! // Add a peer after TCP+TLS+metadata handshake
+//! let peer_id = node.add_peer(peer_public_key, 0);
+//! node.mark_handshake_done(peer_id);
+//!
+//! // Feed incoming data from the peer
+//! let events = node.handle_peer_data(peer_id, &raw_bytes, now_ms, &mut rng);
+//!
+//! // Periodic maintenance
+//! let events = node.poll(now_ms, &mut rng);
+//!
+//! // Send encrypted data to a remote node
+//! let events = node.send(&dest_key, b"hello", now_ms, &mut rng);
+//! ```
+
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
+pub mod wire;
+pub mod crypto;
+pub mod address;
+pub mod bloom;
+pub mod meta;
+pub mod peer;
+pub mod tree;
+pub mod pathfinder;
+pub mod session;
+pub mod node;
+pub mod uri;
+pub mod pool;
+pub mod endpoint;
+pub mod peerlist;
+pub mod icmp;
+pub mod tcp;
+pub mod quality;
+pub mod forward;
+
+// Re-export the main public types for convenience.
+pub use node::{YggdrasilLite, LiteConfig, NodeEvent};
+pub use crypto::PublicKey;
+pub use peer::PeerId;
+pub use wire::PeerPort;
+pub use forward::Event as ForwardEvent;
+pub use endpoint::{frame_ipv6, unframe_ipv6, Action, Direction, Endpoint, PeerInfo, Received, IPV6_FRAME};
+pub use pool::CandidateSource;
+pub use uri::{TcpPeerUri, UriError};
+pub use address::Address;
+pub use peerlist::{tcp_peers_from_json, PeerEntry, DEFAULT_PUBLIC_PEERS_URL};

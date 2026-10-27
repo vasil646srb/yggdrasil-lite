@@ -1,0 +1,54 @@
+[package]
+name = "yggdrasil-lite"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal no_std Yggdrasil leaf node for embedded devices"
+license = "MPL-2.0"
+
+[dependencies]
+ed25519-dalek = { version = "2", default-features = false }
+curve25519-dalek = { version = "4", default-features = false }
+crypto_box = { version = "0.9", default-features = false, features = ["salsa20", "alloc"] }
+sha2 = { version = "0.10", default-features = false }
+blake2 = { version = "0.10", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+# Used by the tcp_node binary (src/bin). Plain Rust, no C dependencies.
+rand = "0.8"
+heapless = "0.8"
+
+# TCP/IP stack (optional, replaces hand-rolled MiniTcp in lite_node example)
+smoltcp = { version = "0.12", optional = true, default-features = false, features = [
+    "std",
+    "alloc",
+    "proto-ipv6",
+    "socket-tcp",
+    "medium-ip",
+] }
+
+[features]
+default = ["std"]
+std = []
+smoltcp = ["dep:smoltcp"]
+# Act as a transit node: merge peer bloom filters into advertisements,
+# forward PathLookup/PathNotify/PathBroken, and forward traffic between peers.
+transit = []
+
+[dev-dependencies]
+hex = "0.4"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+[[test]]
+name = "transit"
+required-features = ["std", "transit"]
+
+[[example]]
+name = "lite_node"
+required-features = ["std"]
+
+[[example]]
+name = "gen_test_keys"
+required-features = ["std"]
+
+# Smaller binaries for routers: symbols stripped.
+[profile.release]
+strip = true

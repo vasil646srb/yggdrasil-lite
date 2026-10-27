@@ -1,0 +1,29 @@
+[target.'cfg(target_arch = "riscv32")']
+runner    = "espflash flash --monitor"
+rustflags = [
+  "-C", "link-arg=-Tlinkall.x",
+  "-C", "force-frame-pointers",
+]
+
+[target.'cfg(target_arch = "xtensa")']
+runner    = "espflash flash --monitor"
+rustflags = [
+  "-C", "link-arg=-Tlinkall.x",
+  "-C", "force-frame-pointers",
+]
+
+[env]
+ESP_LOG = "info"
+# Wi-Fi station to join (the device also opens its own AP "YggLite").
+WIFI_SSID = "YourSSID"
+WIFI_PASSWORD = "YourPassword"
+# Peers as host:port, IPv4 only. Leave empty if unused.
+YGG_PEER1 = "1.2.3.4:1514"
+YGG_PEER2 = ""
+YGG_PEER3 = ""
+# Optional: 64 hex chars (32-byte seed). Keep the same value to keep the address.
+# Without it, the device uses a random seed on every boot (address changes).
+# YGG_SEED = "..."
+
+[unstable]
+build-std = ["alloc", "core"]
