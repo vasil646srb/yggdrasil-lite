@@ -1,4 +1,13 @@
 # yggdrasil-lite
+## Fork
+
+This repository is a personal fork of
+[cleverfox/yggdrasil-lite](https://github.com/cleverfox/yggdrasil-lite)
+(the original project; MPL-2.0). It may contain local modifications,
+experiments or fixes that are not part of the upstream codebase.
+
+- Upstream: https://github.com/cleverfox/yggdrasil-lite.git
+- Origin:   https://github.com/vasil646srb/yggdrasil-lite.git
 
 Minimal [Yggdrasil](https://yggdrasil-network.github.io/) client for embedded devices.
 
