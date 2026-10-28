@@ -55,6 +55,7 @@ pub mod pool;
 pub mod endpoint;
 pub mod peerlist;
 pub mod icmp;
+pub mod udp;
 pub mod tcp;
 pub mod quality;
 pub mod forward;

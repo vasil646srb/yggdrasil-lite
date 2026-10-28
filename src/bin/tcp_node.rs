@@ -41,8 +41,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::io::{ErrorKind, Read, Write};
-use std::net::{Ipv6Addr, Shutdown, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 extern crate alloc;
@@ -51,7 +52,7 @@ extern crate alloc;
 #[path = "../../examples/esp32/src/api_model.rs"]
 #[allow(dead_code)]
 mod api_model;
-use api_model::{overlay_page, to_json, NetState, PeerState, PeerStat, DASHBOARD_HTML, MAX_PEERS};
+use api_model::{to_json, NetState, PeerState, PeerStat, DASHBOARD_HTML, MAX_PEERS};
 
 /// Protocol clock starts here (matches the library tests).
 const CLOCK_BASE: u64 = 1_000;
@@ -64,17 +65,91 @@ const QUALITY_ID: u16 = 0x5155;
 /// Echo `seq` for a probe to a connected peer, and for a probe to the global root.
 const PEER_PROBE_SEQ: u16 = 1;
 const ROOT_PROBE_SEQ: u16 = 2;
+/// Echo `seq` for a probe to an allowed client's overlay address.
+const ALLOW_PROBE_SEQ: u16 = 3;
+/// How often each allowed client's address is pinged.
+const ALLOW_PROBE_INTERVAL: Duration = Duration::from_secs(10);
 /// How often each connected peer is pinged for its latency.
 const PEER_PROBE_INTERVAL: Duration = Duration::from_secs(10);
 /// A peer dropped for being on another root is not redialed for this long.
 const FOREIGN_COOLDOWN_MS: u64 = 30 * 60 * 1000;
+/// UDP forwarding: sessions per (client key, client port, overlay port), idle timeout,
+/// and the largest payload carried (1280 minimum IPv6 MTU minus IPv6 and UDP headers).
+const MAX_UDP_SESSIONS: usize = 64;
+const UDP_IDLE: Duration = Duration::from_secs(60);
+const MAX_UDP_PAYLOAD: usize = 1232;
+
+/// A local UDP socket connected to a forwarded service, for one overlay client.
+struct UdpSession {
+    sock: UdpSocket,
+    client: [u8; 16],
+    client_port: u16,
+    overlay_port: u16,
+    last: Instant,
+}
+
+/// Stage 1 of peer selection: a plain TCP connect to every candidate, measured before any
+/// overlay handshake. Candidates are probed in parallel, and the first round gates dialing.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const PROBE_INTERVAL: Duration = Duration::from_secs(600);
+const PROBE_WORKERS: usize = 8;
+const FIRST_PROBE_MAX_WAIT: Duration = Duration::from_secs(60);
+
+/// TCP connect time to the candidate's address over the regular internet, or `None` on failure.
+fn probe_tcp(uri: &TcpPeerUri) -> Option<u64> {
+    let addr = uri.host_port().to_socket_addrs().ok()?.next()?;
+    let t0 = Instant::now();
+    let stream = TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).ok()?;
+    let rtt = t0.elapsed().as_millis() as u64;
+    drop(stream);
+    Some(rtt)
+}
+
+/// Probe `uris` on `PROBE_WORKERS` threads; each result is sent on `tx`.
+fn spawn_probe_round(uris: Vec<TcpPeerUri>, tx: &mpsc::Sender<(TcpPeerUri, Option<u64>)>) {
+    let mut chunks: Vec<Vec<TcpPeerUri>> = (0..PROBE_WORKERS).map(|_| Vec::new()).collect();
+    for (i, uri) in uris.into_iter().enumerate() {
+        chunks[i % PROBE_WORKERS].push(uri);
+    }
+    for chunk in chunks.into_iter().filter(|c| !c.is_empty()) {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for uri in chunk {
+                let rtt = probe_tcp(&uri);
+                let _ = tx.send((uri, rtt));
+            }
+        });
+    }
+}
+
+/// LAN discovery: multicast group and UDP port for beacons.
+/// yggdrasil-ng uses IPv6 link-local multicast; the URI parser has no zone-id support,
+/// so this build uses IPv4 multicast and advertises plain IPv4 addresses.
+const LAN_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 7);
+const LAN_PORT: u16 = 9001;
+const LAN_MAGIC: &[u8; 4] = b"YGGL";
+const LAN_BEACON_INTERVAL: Duration = Duration::from_secs(3);
+/// Upper bound for accepted inbound connections (on top of `--target`).
+const MAX_INBOUND: usize = 16;
+/// Root latency above this (ms) triggers replacement of the slowest outbound peer.
+const ROOT_RTT_LIMIT_MS: u64 = 200;
+/// Latency to an allowed client above this (ms) also triggers replacement.
+const CLIENT_RTT_LIMIT_MS: u64 = 150;
+/// While the root is slow, it is probed this often, so peers are replaced one at a time on fresh results.
+const SEARCH_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+/// Minimum time between two peer replacements.
+const SWAP_MIN_INTERVAL: Duration = Duration::from_secs(30);
+/// A peer replaced for a high root latency is not redialed for this long.
+const SLOW_PEER_COOLDOWN_MS: u64 = 15 * 60 * 1000;
 
 use rand::rngs::OsRng;
 use rand::RngCore;
 use yggdrasil_lite::icmp::{self, ECHO_REPLY};
+use yggdrasil_lite::uri::TcpPeerUri;
 use yggdrasil_lite::forward::{self, Event as FwdEvent};
-use yggdrasil_lite::quality::{PeerView, Quality, DEFAULT_RECHECK_MS};
-use yggdrasil_lite::{unframe_ipv6, Action, Address, CandidateSource, Direction, Endpoint, PublicKey};
+use yggdrasil_lite::quality::{PeerView, Quality, Verdict, DEFAULT_RECHECK_MS};
+use yggdrasil_lite::address::addr_for_key;
+use yggdrasil_lite::{frame_ipv6, unframe_ipv6, udp, Action, Address, CandidateSource, Direction, Endpoint, PublicKey};
 
 struct Args {
     key: String,
@@ -88,6 +163,14 @@ struct Args {
     quality_ms: u64,
     /// (overlay port, local port) pairs from `--forward`.
     forwards: Vec<(u16, u16)>,
+    /// `--send-udp IPV6 PORT MSG`: send one UDP datagram over the overlay every 5 s (test aid).
+    send_udp: Option<(Ipv6Addr, u16, String)>,
+    /// `--forward-udp`: (overlay port, local port) pairs for UDP.
+    forwards_udp: Vec<(u16, u16)>,
+    /// `--lan`: discover peers on the local network by multicast beacons.
+    lan: bool,
+    /// `--listen PORT`: accept inbound TCP peers and advertise this port in beacons.
+    listen: Option<u16>,
 }
 
 const DEFAULT_PAGE: &str = "<!doctype html>
@@ -99,12 +182,12 @@ const DEFAULT_PAGE: &str = "<!doctype html>
 ";
 
 fn usage() -> ! {
-    eprintln!("usage: tcp_node --key FILE [--peers FILE] [--allow HEXKEY]... [--target N] [--ping IPV6] [--send IPV6 MESSAGE] [--html FILE] [--api ADDR] [--quality-interval SECS] [--forward PORT[:LOCAL],...]");
+    eprintln!("usage: tcp_node --key FILE [--peers FILE] [--allow HEXKEY]... [--target N] [--ping IPV6] [--send IPV6 MESSAGE] [--html FILE] [--api ADDR] [--quality-interval SECS] [--forward PORT[:LOCAL],...] [--forward-udp PORT[:LOCAL],...] [--listen PORT] [--lan]");
     std::process::exit(2);
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { key: String::new(), peers: None, allow: Vec::new(), target: 3, send: None, ping: None, html: None, api: None, quality_ms: DEFAULT_RECHECK_MS, forwards: Vec::new() };
+    let mut a = Args { key: String::new(), peers: None, allow: Vec::new(), target: 3, send: None, ping: None, html: None, api: None, quality_ms: DEFAULT_RECHECK_MS, forwards: Vec::new(), forwards_udp: Vec::new(), send_udp: None, lan: false, listen: None };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         match flag.as_str() {
@@ -127,6 +210,23 @@ fn parse_args() -> Args {
                 let secs: u64 = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
                 a.quality_ms = secs * 1000;
             }
+            "--forward-udp" => {
+                let spec = it.next().unwrap_or_else(|| usage());
+                for part in spec.split(',') {
+                    a.forwards_udp.push(parse_forward(part.trim()).unwrap_or_else(|e| {
+                        eprintln!("--forward-udp: {e}");
+                        std::process::exit(2);
+                    }));
+                }
+            }
+            "--send-udp" => {
+                let addr = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
+                let port = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
+                let msg = it.next().unwrap_or_else(|| usage());
+                a.send_udp = Some((addr, port, msg));
+            }
+            "--lan" => a.lan = true,
+            "--listen" => a.listen = Some(it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
             "--ping" => a.ping = Some(it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
             "--send" => {
                 let addr = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
@@ -138,6 +238,10 @@ fn parse_args() -> Args {
     }
     if a.key.is_empty() {
         usage();
+    }
+    if a.forwards_udp.len() > 16 {
+        eprintln!("at most 16 UDP forwarded ports");
+        std::process::exit(2);
     }
     if a.forwards.len() > 16 {
         eprintln!("at most 16 forwarded ports");
@@ -201,15 +305,30 @@ fn unhex(s: &str) -> Result<Vec<u8>, Box<dyn Error>> {
 }
 
 /// Read the 32-byte seed from `path`, creating it with fresh randomness if absent.
+///
+/// The file is created with mode 0600 and never overwritten. An existing file
+/// readable by other users triggers a warning.
 fn load_or_create_seed(path: &str) -> Result<[u8; 32], Box<dyn Error>> {
     match std::fs::read_to_string(path) {
-        Ok(text) => unhex(text.trim())?
-            .try_into()
-            .map_err(|_| "key file must hold 32 bytes (64 hex chars)".into()),
+        Ok(text) => {
+            if let Ok(meta) = std::fs::metadata(path) {
+                if meta.permissions().mode() & 0o077 != 0 {
+                    eprintln!("warning: {path} is accessible to other users, run: chmod 600 {path}");
+                }
+            }
+            unhex(text.trim())?
+                .try_into()
+                .map_err(|_| "key file must hold 32 bytes (64 hex chars)".into())
+        }
         Err(e) if e.kind() == ErrorKind::NotFound => {
             let mut seed = [0u8; 32];
             OsRng.fill_bytes(&mut seed);
-            std::fs::write(path, hex(&seed))?;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)?;
+            file.write_all(hex(&seed).as_bytes())?;
             Ok(seed)
         }
         Err(e) => Err(e.into()),
@@ -253,6 +372,72 @@ fn run(actions: Vec<Action>, ep: &mut Endpoint, streams: &mut HashMap<usize, Tcp
     }
 }
 
+/// Deliver one overlay UDP datagram to the local service mapped to its destination port.
+fn udp_inbound(
+    sessions: &mut HashMap<(PublicKey, u16, u16), UdpSession>,
+    map: &HashMap<u16, u16>,
+    key: &PublicKey,
+    client: [u8; 16],
+    dg: udp::Datagram,
+) {
+    let Some(&local) = map.get(&dg.dport) else { return };
+    if dg.payload.len() > MAX_UDP_PAYLOAD {
+        return;
+    }
+    let id = (*key, dg.sport, dg.dport);
+    if !sessions.contains_key(&id) {
+        if sessions.len() >= MAX_UDP_SESSIONS {
+            return;
+        }
+        let sock = match UdpSocket::bind(("127.0.0.1", 0)).and_then(|s| {
+            s.connect(("127.0.0.1", local))?;
+            s.set_nonblocking(true)?;
+            Ok(s)
+        }) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("udp: cannot open session to 127.0.0.1:{local}: {e}");
+                return;
+            }
+        };
+        sessions.insert(
+            id,
+            UdpSession { sock, client, client_port: dg.sport, overlay_port: dg.dport, last: Instant::now() },
+        );
+    }
+    if let Some(s) = sessions.get_mut(&id) {
+        let _ = s.sock.send(&dg.payload);
+        s.last = Instant::now();
+    }
+}
+
+/// Beacon: magic, our 32-byte public key, our listen port (big endian).
+fn lan_beacon(key: &PublicKey, port: u16) -> Vec<u8> {
+    let mut b = Vec::with_capacity(38);
+    b.extend_from_slice(LAN_MAGIC);
+    b.extend_from_slice(key);
+    b.extend_from_slice(&port.to_be_bytes());
+    b
+}
+
+/// Parse a beacon; `None` for anything that is not a well-formed beacon.
+fn parse_lan_beacon(b: &[u8]) -> Option<(PublicKey, u16)> {
+    if b.len() != 38 || &b[..4] != LAN_MAGIC {
+        return None;
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&b[4..36]);
+    Some((key, u16::from_be_bytes([b[36], b[37]])))
+}
+
+fn lan_socket() -> Result<UdpSocket, Box<dyn Error>> {
+    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, LAN_PORT))?;
+    sock.join_multicast_v4(&LAN_GROUP, &Ipv4Addr::UNSPECIFIED)?;
+    sock.set_multicast_loop_v4(false)?;
+    sock.set_nonblocking(true)?;
+    Ok(sock)
+}
+
 /// First 4 bytes of a key, as hex, for logs.
 fn short_key(k: &PublicKey) -> String {
     k.iter().take(4).map(|b| format!("{:02x}", b)).collect()
@@ -289,8 +474,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         let added = ep.import_peer_list(&json, CandidateSource::Config);
         println!("imported {added} TCP peers from {path}");
     }
-    for k in &args.allow {
-        ep.allow_key(parse_key(k)?);
+    let allow_keys: Vec<PublicKey> = args.allow.iter().map(|k| parse_key(k)).collect::<Result<_, _>>()?;
+    for k in &allow_keys {
+        ep.allow_key(*k);
     }
     let page = match &args.html {
         Some(path) => std::fs::read(path)?,
@@ -300,7 +486,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let shared: Arc<Mutex<NetState>> = Arc::new(Mutex::new(NetState::new()));
     if let Some(addr) = &args.api {
-        let listener = TcpListener::bind(addr)?;
+        let sock: std::net::SocketAddr = addr
+            .parse()
+            .map_err(|e| format!("--api: invalid address {addr}: {e}"))?;
+        if !sock.ip().is_loopback() {
+            return Err(format!("--api must bind to loopback (127.0.0.1 or [::1]), got {addr}").into());
+        }
+        let listener = TcpListener::bind(sock)?;
         println!("status API:     http://{addr}/  (JSON: /api/stats)");
         let shared = shared.clone();
         std::thread::spawn(move || serve_api(listener, shared));
@@ -331,20 +523,141 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut last_status = Instant::now() - Duration::from_secs(10);
     let mut last_snap = Instant::now() - Duration::from_secs(10);
     let mut quality = Quality::new(args.quality_ms);
+    let mut overlay = OverlayInfo::default();
+    let mut search_probe = Instant::now() - SEARCH_PROBE_INTERVAL;
+    let (probe_tx, probe_rx) = mpsc::channel::<(TcpPeerUri, Option<u64>)>();
+    let mut probe_pending: usize = 0;
+    let mut probe_total: usize = 0;
+    let mut probe_ok: usize = 0;
+    let mut probe_next = Instant::now();
+    let mut first_round = true;
+    let probe_start = Instant::now();
+    ep.set_dial_enabled(false);
+    let mut last_swap = Instant::now() - SWAP_MIN_INTERVAL;
+    let mut allow_sent: HashMap<PublicKey, u64> = HashMap::new();
+    let mut last_allow_probe = Instant::now() - ALLOW_PROBE_INTERVAL;
+    overlay.allow_keys = allow_keys.clone();
     let mut probe_sent: HashMap<PublicKey, u64> = HashMap::new();
     let mut root_probe: Option<(PublicKey, u64)> = None;
     let mut last_probe = Instant::now() - PEER_PROBE_INTERVAL;
     let mut fwd_streams: HashMap<u32, TcpStream> = HashMap::new();
     let mut fwd_eof: HashSet<u32> = HashSet::new();
     let mut last_send = Instant::now();
+    let mut last_send_udp = Instant::now() - Duration::from_secs(5);
     let mut last_ping = Instant::now() - Duration::from_secs(1);
     let mut ping_seq: u16 = 0;
     let mut ping_sent: HashMap<u16, Instant> = HashMap::new();
+    let udp_map: HashMap<u16, u16> = args.forwards_udp.iter().copied().collect();
+    let mut udp_sessions: HashMap<(PublicKey, u16, u16), UdpSession> = HashMap::new();
+    for (overlay, local) in &args.forwards_udp {
+        println!("forward udp:    overlay port {overlay} -> 127.0.0.1:{local}");
+    }
+    let lan = if args.lan { Some(lan_socket()?) } else { None };
+    let mut last_beacon = Instant::now() - LAN_BEACON_INTERVAL;
+    let listener = match args.listen {
+        Some(port) => {
+            let l = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))?;
+            l.set_nonblocking(true)?;
+            println!("listen:         tcp 0.0.0.0:{port} (inbound, max {MAX_INBOUND})");
+            Some(l)
+        }
+        None => None,
+    };
+    if args.lan {
+        println!("lan discovery:  {LAN_GROUP}:{LAN_PORT} (beacon every {}s)", LAN_BEACON_INTERVAL.as_secs());
+    }
 
     loop {
         let now = clock(start);
         let actions = ep.poll(now, &mut rng);
         run(actions, &mut ep, &mut streams, now);
+
+        // LAN discovery: send our beacon, read others and add them as pinned candidates.
+        if let Some(sock) = lan.as_ref() {
+            if let Some(port) = args.listen {
+                if last_beacon.elapsed() >= LAN_BEACON_INTERVAL {
+                    last_beacon = Instant::now();
+                    let _ = sock.send_to(&lan_beacon(ep.public_key(), port), (LAN_GROUP, LAN_PORT));
+                }
+            }
+            let mut buf = [0u8; 64];
+            while let Ok((n, src)) = sock.recv_from(&mut buf) {
+                let Some((key, port)) = parse_lan_beacon(&buf[..n]) else { continue };
+                if key == *ep.public_key() {
+                    continue;
+                }
+                if let SocketAddr::V4(v4) = src {
+                    let uri = format!("tcp://{}:{}?key={}", v4.ip(), port, hex(&key));
+                    match ep.add_peer_uri(&uri, CandidateSource::Discovered) {
+                        Ok(true) => println!("lan: discovered {uri}"),
+                        Ok(false) => {}
+                        Err(e) => println!("lan: bad beacon from {src}: {e:?}"),
+                    }
+                }
+            }
+        }
+
+        // Inbound TCP peers (only when --listen is set).
+        if let Some(l) = listener.as_ref() {
+            while let Ok((stream, from)) = l.accept() {
+                if streams.len() >= args.target + MAX_INBOUND {
+                    drop(stream);
+                    continue;
+                }
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_nodelay(true);
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(1)));
+                let (slot, acts) = ep.accept_transport(now);
+                streams.insert(slot, stream);
+                run(acts, &mut ep, &mut streams, now);
+                println!("inbound from {from}");
+            }
+        }
+
+        // Stage 1: TCP-ping every candidate that is not connected yet.
+        if probe_pending == 0 && Instant::now() >= probe_next {
+            probe_next = Instant::now() + PROBE_INTERVAL;
+            let connected: HashSet<String> = ep
+                .connected_peers()
+                .iter()
+                .filter(|p| p.direction == Direction::Outbound)
+                .filter_map(|p| p.uri.as_ref().map(|u| u.host_port()))
+                .collect();
+            let uris: Vec<TcpPeerUri> = ep
+                .candidates()
+                .into_iter()
+                .map(|c| c.uri)
+                .filter(|u| !connected.contains(&u.host_port()))
+                .collect();
+            probe_pending = uris.len();
+            probe_total = uris.len();
+            probe_ok = 0;
+            if probe_pending == 0 {
+                if first_round {
+                    ep.set_dial_enabled(true);
+                    first_round = false;
+                }
+            } else {
+                println!("probe: checking {} candidates", probe_pending);
+                spawn_probe_round(uris, &probe_tx);
+            }
+        }
+        while let Ok((uri, rtt)) = probe_rx.try_recv() {
+            if rtt.is_some() {
+                probe_ok += 1;
+            }
+            ep.record_candidate_probe(&uri, rtt);
+            probe_pending = probe_pending.saturating_sub(1);
+            if probe_pending == 0 {
+                println!("probe: done, {probe_ok}/{probe_total} reachable");
+            }
+        }
+        if first_round && (probe_pending == 0 || probe_start.elapsed() >= FIRST_PROBE_MAX_WAIT) {
+            ep.set_dial_enabled(true);
+            first_round = false;
+            println!("probe: first round finished, dialing");
+        }
 
         let slots: Vec<usize> = streams.keys().copied().collect();
         for slot in slots {
@@ -380,6 +693,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 quality.record_rtt(&msg.from_key, now.saturating_sub(sent));
                             }
                         }
+                        ALLOW_PROBE_SEQ => {
+                            if let Some(sent) = allow_sent.remove(&msg.from_key) {
+                                let sample = now.saturating_sub(sent);
+                                overlay.allow_rtt.insert(msg.from_key, (sample, now));
+                            }
+                        }
                         ROOT_PROBE_SEQ => {
                             if let Some((root, sent)) = root_probe {
                                 if root == msg.from_key {
@@ -390,6 +709,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                         }
                         _ => {}
                     }
+                    continue;
+                }
+            }
+            if let Some(dg) = udp::parse(unframe_ipv6(&msg.data)) {
+                if dg.dst == ep.address().0 && udp_map.contains_key(&dg.dport) {
+                    udp_inbound(&mut udp_sessions, &udp_map, &msg.from_key, msg.from.0, dg);
                     continue;
                 }
             }
@@ -428,6 +753,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
+        if let Some((dest, dport, text)) = &args.send_udp {
+            if last_send_udp.elapsed() >= Duration::from_secs(5) {
+                last_send_udp = Instant::now();
+                let our = ep.address().0;
+                let pkt = udp::build(our, dest.octets(), 40000, *dport, text.as_bytes());
+                let acts = ep.send_to_address(&Address(dest.octets()), &frame_ipv6(&pkt), clock(start), &mut rng);
+                run(acts, &mut ep, &mut streams, clock(start));
+            }
+        }
+
         if let Some((dest, text)) = &args.send {
             if last_send.elapsed() >= Duration::from_secs(10) {
                 last_send = Instant::now();
@@ -441,7 +776,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let snap = snapshot(&ep, clock(start));
             // Overlay page (port 80 over Yggdrasil): the live stats, unless the user gave --html.
             if args.html.is_none() {
-                ep.serve_http(overlay_page(&to_json(&snap)).into_bytes());
+                ep.serve_http(status_page(&ep, &quality, &overlay, args.target, clock(start)).into_bytes());
             }
             if args.api.is_some() {
                 *shared.lock().unwrap() = snap;
@@ -516,12 +851,107 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
+        // UDP forwarding: send local replies back over the overlay; drop idle sessions.
+        if !udp_sessions.is_empty() {
+            let our = ep.address().0;
+            let mut replies: Vec<([u8; 16], u16, u16, Vec<u8>)> = Vec::new();
+            let mut buf = [0u8; 2048];
+            udp_sessions.retain(|_, s| s.last.elapsed() < UDP_IDLE);
+            for s in udp_sessions.values_mut() {
+                while let Ok(n) = s.sock.recv(&mut buf) {
+                    s.last = Instant::now();
+                    if n <= MAX_UDP_PAYLOAD {
+                        replies.push((s.client, s.overlay_port, s.client_port, buf[..n].to_vec()));
+                    }
+                }
+            }
+            for (client, overlay, client_port, payload) in replies {
+                let pkt = udp::build(our, client, overlay, client_port, &payload);
+                let acts = ep.send_to_address(&Address(client), &frame_ipv6(&pkt), now, &mut rng);
+                run(acts, &mut ep, &mut streams, now);
+            }
+        }
+
         if last_probe.elapsed() >= PEER_PROBE_INTERVAL {
             last_probe = Instant::now();
             for p in ep.connected_peers().into_iter().filter(|p| p.direction == Direction::Outbound) {
                 probe_sent.insert(p.key, now);
                 let acts = ep.ping_key(&p.key, QUALITY_ID, PEER_PROBE_SEQ, now, &mut rng);
                 run(acts, &mut ep, &mut streams, now);
+            }
+        }
+
+        if last_allow_probe.elapsed() >= ALLOW_PROBE_INTERVAL {
+            last_allow_probe = Instant::now();
+            let me = *ep.public_key();
+            for k in allow_keys.iter().filter(|k| **k != me) {
+                allow_sent.insert(*k, now);
+                let acts = ep.ping(&addr_for_key(k), QUALITY_ID, ALLOW_PROBE_SEQ, now, &mut rng);
+                run(acts, &mut ep, &mut streams, now);
+            }
+        }
+
+        // Peer search: replace one slow outbound peer at a time. The root is re-probed every
+        // SEARCH_PROBE_INTERVAL while it is slow; a swap needs a fresh result above the limit.
+        {
+            let me = *ep.public_key();
+            // A swap needs a fresh root measurement above the limit. `searching` only keeps
+            // the root probes going until a measurement comes back under the limit.
+            let root_fresh = quality.root_rtt();
+            if let Some(rtt) = root_fresh {
+                overlay.searching = rtt > ROOT_RTT_LIMIT_MS;
+            }
+            let root_slow = root_fresh.map_or(false, |r| r > ROOT_RTT_LIMIT_MS)
+                && overlay.root.map_or(false, |r| r != me);
+            let slow_client = overlay
+                .allow_rtt
+                .iter()
+                .filter(|(k, _)| **k != me)
+                .map(|(_, (r, _))| *r)
+                .max()
+                .filter(|r| *r > CLIENT_RTT_LIMIT_MS);
+            if (root_slow || slow_client.is_some()) && last_swap.elapsed() >= SWAP_MIN_INTERVAL {
+                let outbound = ep
+                    .connected_peers()
+                    .iter()
+                    .filter(|p| p.direction == Direction::Outbound)
+                    .count();
+                if ep.candidates().len() > outbound {
+                    if let Some(worst) = worst_outbound(&ep, &quality) {
+                        let msg = if root_slow {
+                            format!(
+                                "корень {} ms > {ROOT_RTT_LIMIT_MS} ms: заменён пир {}",
+                                root_fresh.unwrap_or(0),
+                                short_key(&worst)
+                            )
+                        } else {
+                            format!(
+                                "клиент {} ms > {CLIENT_RTT_LIMIT_MS} ms: заменён пир {}",
+                                slow_client.unwrap_or(0),
+                                short_key(&worst)
+                            )
+                        };
+                        println!("{msg}");
+                        overlay.swaps.push(msg);
+                        if overlay.swaps.len() > 5 {
+                            overlay.swaps.remove(0);
+                        }
+                        let acts = ep.drop_peer(&worst, now, SLOW_PEER_COOLDOWN_MS);
+                        run(acts, &mut ep, &mut streams, now);
+                        quality.forget(&worst);
+                        quality.clear_root_rtt();
+                        overlay.allow_rtt.clear();
+                        last_swap = Instant::now();
+                    }
+                }
+            }
+            if overlay.searching && root_probe.is_none() && search_probe.elapsed() >= SEARCH_PROBE_INTERVAL {
+                if let Some(root) = overlay.root.filter(|r| *r != me) {
+                    search_probe = Instant::now();
+                    root_probe = Some((root, now));
+                    let acts = ep.ping_key(&root, QUALITY_ID, ROOT_PROBE_SEQ, now, &mut rng);
+                    run(acts, &mut ep, &mut streams, now);
+                }
             }
         }
 
@@ -540,6 +970,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .collect();
             if !peers.is_empty() {
                 let verdict = quality.evaluate(&peers, &ep.root(), now);
+                overlay.verdict = Some(verdict.clone());
+                overlay.eval_at = Some(now);
+                overlay.root = verdict.global_root;
                 let root_text = verdict.global_root.map(|r| short_key(&r)).unwrap_or_else(|| "none".into());
                 let rtt_text = quality.root_rtt().map(|r| format!("{r} ms")).unwrap_or_else(|| "?".into());
                 println!(
@@ -574,8 +1007,210 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         // Shorter sleep while forwarded sessions are open, so bytes are not delayed.
-        std::thread::sleep(Duration::from_millis(if fwd_streams.is_empty() { 100 } else { 5 }));
+        // Loop period bounds the measured latency: each echo is picked up on the next pass, so
+        // a 100 ms sleep added up to ~200 ms of error per round trip. 10 ms keeps it near the real value.
+        std::thread::sleep(Duration::from_millis(if fwd_streams.is_empty() { 10 } else { 5 }));
     }
+}
+
+
+/// Analysis state shown on the overlay status page.
+#[derive(Default)]
+struct OverlayInfo {
+    verdict: Option<Verdict>,
+    /// Protocol time of the last evaluation.
+    eval_at: Option<u64>,
+    /// Recent peer replacements, newest last.
+    swaps: Vec<String>,
+    /// Allowed clients (from --allow), in the order given.
+    allow_keys: Vec<PublicKey>,
+    /// Latest echo round trip to each allowed client's address: (rtt ms, protocol time of sample).
+    allow_rtt: HashMap<PublicKey, (u64, u64)>,
+    /// Root of the global network from the last evaluation.
+    root: Option<PublicKey>,
+    /// True while the root latency is above the limit.
+    searching: bool,
+}
+
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// Slowest connected outbound peer by measured latency (falls back to the pool estimate).
+fn worst_outbound(ep: &Endpoint, quality: &Quality) -> Option<PublicKey> {
+    ep.connected_peers()
+        .into_iter()
+        .filter(|p| p.direction == Direction::Outbound)
+        .filter_map(|p| quality.rtt(&p.key).or(p.rtt_ms).map(|r| (r, p.key)))
+        .max_by_key(|(r, _)| *r)
+        .map(|(_, k)| k)
+}
+
+/// Live update for the overlay status page: re-fetch the page every 2 s and swap the body in place.
+/// The overlay server answers any request with the current page, so no extra endpoint is needed.
+const STATUS_SCRIPT: &str = r#"<script>
+(function () {
+  var busy = false;
+  function setUpd(text) {
+    var el = document.getElementById('upd');
+    if (el) { el.textContent = text; }
+  }
+  function tick() {
+    if (busy) { return; }
+    busy = true;
+    fetch(location.href, { cache: 'no-store' })
+      .then(function (r) { return r.text(); })
+      .then(function (t) {
+        var doc = new DOMParser().parseFromString(t, 'text/html');
+        document.body.innerHTML = doc.body.innerHTML;
+        renderSpeed();
+        setUpd('обновлено ' + new Date().toLocaleTimeString());
+      })
+      .catch(function () { setUpd('нет связи, повтор...'); })
+      .then(function () { busy = false; });
+  }
+  var speedText = 'не запускался';
+  var speedBusy = false;
+  function renderSpeed() {
+    var el = document.getElementById('speed');
+    if (el) { el.textContent = speedText; }
+  }
+  window.runSpeed = function () {
+    if (speedBusy) { return; }
+    speedBusy = true;
+    speedText = 'измерение...';
+    renderSpeed();
+    var ctrl = new AbortController();
+    var timer = setTimeout(function () { ctrl.abort(); }, 20000);
+    var t0 = performance.now();
+    fetch('/speed?' + Date.now(), { cache: 'no-store', signal: ctrl.signal })
+      .then(function (r) { return r.arrayBuffer(); })
+      .then(function (buf) {
+        var sec = (performance.now() - t0) / 1000;
+        var mbit = buf.byteLength * 8 / sec / 1e6;
+        speedText = mbit.toFixed(2) + ' Мбит/с (' + buf.byteLength + ' байт за ' + sec.toFixed(1) + ' с)';
+      })
+      .catch(function () { speedText = 'не удалось: таймаут или обрыв канала'; })
+      .then(function () { clearTimeout(timer); speedBusy = false; renderSpeed(); });
+  };
+  setInterval(tick, 2000);
+})();
+</script>"#;
+
+/// HTML status page for the overlay port 80: every `--target` slot, root summary, replacement log.
+fn status_page(ep: &Endpoint, quality: &Quality, info: &OverlayInfo, target: usize, now: u64) -> String {
+    let outbound: Vec<_> = ep
+        .connected_peers()
+        .into_iter()
+        .filter(|p| p.direction == Direction::Outbound)
+        .collect();
+
+    let root_line = match quality.root_rtt() {
+        Some(r) if r > ROOT_RTT_LIMIT_MS => format!("<span class=\"bad\">{r} ms (больше {ROOT_RTT_LIMIT_MS} ms)</span>"),
+        Some(r) => format!("<span class=\"ok\">{r} ms</span>"),
+        None => "нет измерения".into(),
+    };
+    let (root_text, global_n, foreign_n, unknown_n, eval_text) = match &info.verdict {
+        Some(v) => (
+            v.global_root.map(|r| short_key(&r)).unwrap_or_else(|| "нет".into()),
+            v.global.len(),
+            v.foreign.len(),
+            v.unknown.len(),
+            info.eval_at
+                .map(|t| format!("{} с назад", now.saturating_sub(t) / 1000))
+                .unwrap_or_default(),
+        ),
+        None => ("ещё не оценено".into(), 0, 0, 0, String::new()),
+    };
+
+    let mut rows = String::new();
+    for p in &outbound {
+        let uri = p.uri.as_ref().map(|u| u.to_string()).unwrap_or_else(|| "?".into());
+        let rtt = quality
+            .rtt(&p.key)
+            .or(p.rtt_ms)
+            .map(|r| format!("{r} ms"))
+            .unwrap_or_else(|| "?".into());
+        let net = match info.verdict.as_ref() {
+            Some(v) if v.global.contains(&p.key) => "главный корень",
+            Some(v) if v.foreign.contains(&p.key) => "чужой корень",
+            Some(_) => "ожидание",
+            None => "—",
+        };
+        let up = now.saturating_sub(p.up_ms) / 1000;
+        rows.push_str(&format!(
+            "<tr><td>{}</td><td><code>{}…</code></td><td>{}</td><td>{}</td><td>{} с</td><td class=\"ok\">подключён</td></tr>\n",
+            esc(&uri),
+            short_key(&p.key),
+            rtt,
+            net,
+            up
+        ));
+    }
+    for _ in outbound.len()..target {
+        rows.push_str("<tr><td colspan=\"6\" class=\"dim\">слот свободен: подбирается кандидат</td></tr>\n");
+    }
+
+    let mut allow_rows = String::new();
+    for k in &info.allow_keys {
+        let addr = Ipv6Addr::from(addr_for_key(k).0);
+        let (rtt_cell, status) = match info.allow_rtt.get(k) {
+            Some((r, at)) => {
+                let age = now.saturating_sub(*at) / 1000;
+                let cls = if *r > CLIENT_RTT_LIMIT_MS { "bad" } else { "ok" };
+                let st = if *r > CLIENT_RTT_LIMIT_MS { "высокий" } else { "в норме" };
+                (format!("<span class=\"{cls}\">{r} ms</span> ({age} с назад)"), st)
+            }
+            None => ("нет ответа".into(), "клиент не отвечает на echo"),
+        };
+        allow_rows.push_str(&format!(
+            "<tr><td><code>{}…</code></td><td><code>{addr}</code></td><td>{rtt_cell}</td><td>{status}</td></tr>\n",
+            short_key(k)
+        ));
+    }
+    if allow_rows.is_empty() {
+        allow_rows.push_str("<tr><td colspan=\"4\" class=\"dim\">разрешённых клиентов нет (--allow)</td></tr>\n");
+    }
+
+    let swaps: String = if info.swaps.is_empty() {
+        "<p class=\"dim\">замен не было</p>".into()
+    } else {
+        let items: String = info.swaps.iter().rev().map(|s| format!("<li>{}</li>", esc(s))).collect();
+        format!("<ul>{items}</ul>")
+    };
+
+    format!(
+        "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+{script}<title>yggdrasil-lite</title>\
+<style>body{{font-family:sans-serif;margin:1.5em;color:#222}}table{{border-collapse:collapse;width:100%;font-size:14px}}\
+td,th{{border:1px solid #ccc;padding:4px 6px;text-align:left}}.ok{{color:#080}}.bad{{color:#c00;font-weight:bold}}\
+.dim{{color:#888}}code{{font-size:12px}}</style></head><body>\
+<h1>yggdrasil-lite</h1>\
+<p>адрес: <code>{addr}</code><br>ключ: <code>{pk}…</code></p>\
+<p class=\"dim\" id=\"upd\">загрузка данных…</p>\
+<h2>Сводка до корня</h2>\
+<table>\
+<tr><th>корень сети</th><td><code>{root_text}</code></td></tr>\
+<tr><th>пинг до корня</th><td>{root_line}</td></tr>\
+<tr><th>пиры на главном корне</th><td>{global_n}</td></tr>\
+<tr><th>на чужом корне</th><td>{foreign_n}</td></tr>\
+<tr><th>не определены</th><td>{unknown_n}</td></tr>\
+<tr><th>порог замены</th><td>корень {ROOT_RTT_LIMIT_MS} ms, клиент {CLIENT_RTT_LIMIT_MS} ms</td></tr>\
+<tr><th>последняя оценка</th><td>{eval_text}</td></tr>\
+</table>\
+<h2>Пиры (--target {target})</h2>\
+<table><tr><th>адрес</th><th>ключ</th><th>RTT</th><th>сеть</th><th>аптайм</th><th>статус</th></tr>\n{rows}</table>\
+<h2>Разрешённые клиенты (адрес до клиента)</h2>\
+<table><tr><th>ключ</th><th>адрес</th><th>RTT</th><th>статус</th></tr>\n{allow_rows}</table>\
+<h2>Тест скорости (канал до узла)</h2>\
+<p><button onclick=\"runSpeed()\">Тест скорости (256 КБ)</button> <span id=\"speed\">не запускался</span></p>\
+<h2>Замены пиров</h2>{swaps}\
+</body></html>",
+        addr = Ipv6Addr::from(ep.address().0),
+        pk = short_key(ep.public_key()),
+        script = STATUS_SCRIPT,
+    )
 }
 
 /// Build the status snapshot from the endpoint: node counters plus up to
@@ -660,4 +1295,56 @@ fn handle_api_conn(mut conn: TcpStream, shared: &Mutex<NetState>) {
         body.len()
     );
     let _ = conn.write_all(resp.as_bytes());
+}
+
+#[cfg(test)]
+mod status_page_tests {
+    use super::*;
+
+    #[test]
+    fn renders_all_target_slots_and_root_summary() {
+        let ep = Endpoint::new([7u8; 32], None, 3);
+        let q = Quality::new(DEFAULT_RECHECK_MS);
+        let mut info = OverlayInfo::default();
+        info.swaps.push("корень 200 ms > 150 ms: заменён пир 0a0b0c0d".into());
+        let html = status_page(&ep, &q, &info, 3, 5_000);
+        assert_eq!(html.matches("слот свободен").count(), 3);
+        assert!(html.contains("Сводка до корня"));
+        assert!(html.contains("setInterval"));
+        assert!(!html.contains("http-equiv"));
+        assert!(html.contains("id=\"upd\""));
+        assert!(html.contains("замены"), "{html}");
+        assert!(html.contains("разрешённых клиентов нет"));
+
+        let mut info2 = OverlayInfo::default();
+        let client = [9u8; 32];
+        info2.allow_keys.push(client);
+        info2.allow_rtt.insert(client, (220, 4_000));
+        let html2 = status_page(&ep, &q, &info2, 3, 5_000);
+        assert!(html2.contains("220 ms"));
+        assert!(html2.contains("высокий"));
+    }
+}
+
+#[cfg(test)]
+mod lan_beacon_tests {
+    use super::*;
+
+    #[test]
+    fn beacon_round_trip() {
+        let key = [0x42u8; 32];
+        let b = lan_beacon(&key, 9000);
+        assert_eq!(b.len(), 38);
+        assert_eq!(parse_lan_beacon(&b), Some((key, 9000)));
+    }
+
+    #[test]
+    fn rejects_malformed_beacons() {
+        let key = [1u8; 32];
+        let mut bad_magic = lan_beacon(&key, 1);
+        bad_magic[0] = b'X';
+        assert_eq!(parse_lan_beacon(&bad_magic), None);
+        assert_eq!(parse_lan_beacon(&lan_beacon(&key, 1)[..37]), None);
+        assert_eq!(parse_lan_beacon(&[]), None);
+    }
 }

@@ -27,6 +27,8 @@ const CLOSE_COOLDOWN_MS: u64 = 5_000;
 const UNKNOWN_RTT_MS: u64 = 5_000;
 /// Each failure adds this much to a candidate's score.
 const FAILURE_PENALTY_MS: u64 = 1_000;
+/// Latency recorded for a candidate whose pre-dial probe failed.
+pub const PROBE_FAIL_RTT_MS: u64 = 5_000;
 
 /// Where a candidate came from. Informational; the pool treats them alike.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +74,8 @@ pub struct CandidateInfo {
 pub struct PeerPool {
     candidates: Vec<Candidate>,
     slots: Vec<SlotState>,
+    /// False while the first probe round runs: nothing is dialed until it is set back to true.
+    dial_enabled: bool,
 }
 
 impl PeerPool {
@@ -80,7 +84,25 @@ impl PeerPool {
         Self {
             candidates: Vec::new(),
             slots: alloc::vec![SlotState::Idle; target_outbound],
+            dial_enabled: true,
         }
+    }
+
+    /// Allow or hold back dialing. Used to run a probe round before the first connections.
+    pub fn set_dial_enabled(&mut self, on: bool) {
+        self.dial_enabled = on;
+    }
+
+    /// Record a pre-dial probe result for `uri`: `Some(ms)` is a measured round trip, `None` a failure.
+    /// The estimate is a moving average, so a failed probe moves the candidate to the back of the order.
+    pub fn record_probe(&mut self, uri: &TcpPeerUri, rtt_ms: Option<u64>) {
+        let id = uri.host_port();
+        let Some(c) = self.candidates.iter_mut().find(|c| c.uri.host_port() == id) else { return };
+        let sample = rtt_ms.unwrap_or(PROBE_FAIL_RTT_MS);
+        c.rtt_ms = Some(match c.rtt_ms {
+            Some(old) => (old * 3 + sample) / 4,
+            None => sample,
+        });
     }
 
     pub fn target(&self) -> usize {
@@ -135,6 +157,9 @@ impl PeerPool {
     /// Fill idle slots with the best eligible candidates. Returns the dials to start.
     pub fn schedule(&mut self, now_ms: u64) -> Vec<(SlotId, TcpPeerUri)> {
         let mut dials = Vec::new();
+        if !self.dial_enabled {
+            return dials;
+        }
         for slot in 0..self.slots.len() {
             if self.slots[slot] != SlotState::Idle {
                 continue;
@@ -340,5 +365,30 @@ mod tests {
         assert!(p.expire(DIAL_TIMEOUT_MS - 1).is_empty());
         assert_eq!(p.expire(DIAL_TIMEOUT_MS), vec![0]);
         assert_eq!(p.connected(), 0);
+    }
+
+    #[test]
+    fn probe_order_and_dial_gate() {
+        let mut p = PeerPool::new(1);
+        p.add_candidate(uri("tcp://slow.example:1514"), CandidateSource::Config);
+        p.add_candidate(uri("tcp://fast.example:1514"), CandidateSource::Config);
+        p.set_dial_enabled(false);
+        assert!(p.schedule(0).is_empty(), "held back until probes finish");
+        p.record_probe(&uri("tcp://slow.example:1514"), Some(300));
+        p.record_probe(&uri("tcp://fast.example:1514"), Some(20));
+        p.set_dial_enabled(true);
+        let d = p.schedule(0);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].1.host_port(), "fast.example:1514");
+    }
+
+    #[test]
+    fn failed_probe_moves_candidate_last() {
+        let mut p = PeerPool::new(1);
+        p.add_candidate_with_rtt(uri("tcp://dead.example:1514"), CandidateSource::Config, Some(10));
+        p.add_candidate_with_rtt(uri("tcp://ok.example:1514"), CandidateSource::Config, Some(100));
+        p.record_probe(&uri("tcp://dead.example:1514"), None);
+        let d = p.schedule(0);
+        assert_eq!(d[0].1.host_port(), "ok.example:1514");
     }
 }

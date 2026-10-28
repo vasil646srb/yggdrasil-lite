@@ -236,7 +236,11 @@ impl HttpServer {
 
                 if !c.responded && contains(&c.req, b"\r\n\r\n") {
                     c.responded = true;
-                    let response = http_response(page);
+                    let response = if c.req.starts_with(b"GET /speed") {
+                        speed_response()
+                    } else {
+                        http_response(page)
+                    };
                     for chunk in response.chunks(MSS) {
                         out.push(build(our, c.peer, HTTP_PORT, c.pport, c.snd_nxt, c.rcv_nxt, PSH | ACK, chunk, false));
                         c.snd_nxt = c.snd_nxt.wrapping_add(chunk.len() as u32);
@@ -258,6 +262,18 @@ impl HttpServer {
         }
         out
     }
+}
+
+/// Speed-test body: `SPEED_BYTES` filler bytes, served for `GET /speed`.
+const SPEED_BYTES: usize = 256 * 1024;
+
+fn speed_response() -> Vec<u8> {
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {SPEED_BYTES}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+    );
+    let mut out = head.into_bytes();
+    out.resize(out.len() + SPEED_BYTES, 0x55);
+    out
 }
 
 fn http_response(page: &[u8]) -> Vec<u8> {
@@ -307,6 +323,21 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 200 OK"));
         assert!(text.ends_with("<html>ok</html>"));
         assert!(out.iter().any(|s| s.has(FIN)));
+    }
+
+    #[test]
+    fn speed_endpoint_serves_fixed_size_body() {
+        let mut srv = HttpServer::new(b"page".to_vec());
+        let syn = parse(&build(A, B, 50001, 80, 100, 0, SYN, &[], false)).unwrap();
+        let sa = parse(&srv.handle(B, &syn)[0]).unwrap();
+        let req = b"GET /speed?1 HTTP/1.1\r\nHost: x\r\n\r\n";
+        let get = parse(&build(A, B, 50001, 80, 101, sa.seq.wrapping_add(1), ACK | PSH, req, false)).unwrap();
+        let out: Vec<Segment> = srv.handle(B, &get).iter().filter_map(|p| parse(p)).collect();
+        let body: Vec<u8> = out.iter().flat_map(|s| s.payload.clone()).collect();
+        let head_end = body.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        assert!(body.starts_with(b"HTTP/1.1 200 OK"));
+        assert_eq!(body.len() - head_end, SPEED_BYTES);
+        assert!(!body.windows(4).any(|w| w == b"page"));
     }
 
     #[test]

@@ -77,6 +77,11 @@ impl Quality {
         }
     }
 
+    /// Forget the latest root measurement, e.g. after the peer set changed.
+    pub fn clear_root_rtt(&mut self) {
+        self.root_rtt = None;
+    }
+
     /// Feed one echo round trip to `key`.
     pub fn record_rtt(&mut self, key: &PublicKey, sample_ms: u64) {
         match self.rtt.get_mut(key) {

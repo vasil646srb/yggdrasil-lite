@@ -404,6 +404,16 @@ impl Endpoint {
         out
     }
 
+    /// Hold back or release outbound dialing (see [`PeerPool::set_dial_enabled`]).
+    pub fn set_dial_enabled(&mut self, on: bool) {
+        self.pool.set_dial_enabled(on);
+    }
+
+    /// Record a pre-dial probe to a candidate: `Some(ms)` on success, `None` on failure.
+    pub fn record_candidate_probe(&mut self, uri: &TcpPeerUri, rtt_ms: Option<u64>) {
+        self.pool.record_probe(uri, rtt_ms);
+    }
+
     /// Candidates with their measured latency and failure counts.
     pub fn candidates(&self) -> Vec<CandidateInfo> {
         self.pool.candidates_info()

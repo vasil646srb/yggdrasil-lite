@@ -17,7 +17,7 @@
 # from the target triple: aarch64-openwrt-linux-musl-gcc, mipsel-openwrt-linux-musl-gcc,
 # x86_64-openwrt-linux-musl-gcc.
 #
-# Output: target/<triple>/release/examples/tcp_node (or target/release/ for host builds).
+# Output: target/<triple>/release/tcp_node (or target/release/tcp_node for host builds).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -32,10 +32,10 @@ openwrt_build() {
     [[ -x "$linker" ]] || die "linker not found: $linker"
     local env_var="CARGO_TARGET_$(echo "$triple" | tr 'a-z-' 'A-Z_')_LINKER"
     rustup target add "$triple"
-    env "$env_var=$linker" cargo build --release --target "$triple" --example tcp_node
+    env "$env_var=$linker" cargo build --release --target "$triple" --bin tcp_node
     "$OPENWRT_TOOLCHAIN_BIN/${linker_prefix}-openwrt-linux-musl-strip" \
-        "target/$triple/release/examples/tcp_node" 2>/dev/null || true
-    echo "built: target/$triple/release/examples/tcp_node"
+        "target/$triple/release/tcp_node" 2>/dev/null || true
+    echo "built: target/$triple/release/tcp_node"
 }
 
 case "$profile" in
