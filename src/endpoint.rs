@@ -83,6 +83,8 @@ pub struct PeerInfo {
     pub rtt_ms: Option<u64>,
     /// When the session came up, on the caller's clock.
     pub up_ms: u64,
+    /// Outbound peer found by LAN discovery.
+    pub lan: bool,
 }
 
 /// An application datagram delivered to this device.
@@ -181,6 +183,17 @@ impl Endpoint {
     /// `target_outbound` is how many outbound peers to keep connected (one
     /// pool slot each). Use at least 1.
     pub fn new(private_key: [u8; 32], password: Option<Vec<u8>>, target_outbound: usize) -> Self {
+        Self::new_with_lan(private_key, password, target_outbound, 0)
+    }
+
+    /// Like [`Endpoint::new`], plus `lan_slots` outbound slots that only take peers found
+    /// by LAN discovery ([`CandidateSource::Discovered`]).
+    pub fn new_with_lan(
+        private_key: [u8; 32],
+        password: Option<Vec<u8>>,
+        target_outbound: usize,
+        lan_slots: usize,
+    ) -> Self {
         let signing = SigningKey::from_bytes(&private_key);
         let mut cfg = LiteConfig::new(private_key);
         cfg.password = password.clone();
@@ -191,8 +204,8 @@ impl Endpoint {
             public,
             password,
             node,
-            pool: PeerPool::new(target_outbound),
-            conns: (0..target_outbound).map(|_| None).collect(),
+            pool: PeerPool::with_lan_slots(target_outbound, lan_slots),
+            conns: (0..target_outbound + lan_slots).map(|_| None).collect(),
             inbox: VecDeque::new(),
             pending: VecDeque::new(),
             allowed: Vec::new(),
@@ -229,8 +242,42 @@ impl Endpoint {
         now_ms: u64,
         rng: &mut impl CryptoRngCore,
     ) -> Vec<Action> {
-        let pkt = icmp::build_echo(self.address().0, dest.0, ECHO_REQUEST, id, seq, &PING_PAYLOAD);
+        self.ping_payload(dest, id, seq, &PING_PAYLOAD, now_ms, rng)
+    }
+
+    /// Like [`Endpoint::ping`] but with a caller-chosen echo payload. A reply echoes
+    /// the payload back, so the caller can match it to its own request.
+    pub fn ping_payload(
+        &mut self,
+        dest: &Address,
+        id: u16,
+        seq: u16,
+        payload: &[u8],
+        now_ms: u64,
+        rng: &mut impl CryptoRngCore,
+    ) -> Vec<Action> {
+        let pkt = icmp::build_echo(self.address().0, dest.0, ECHO_REQUEST, id, seq, payload);
         self.send_to_address(dest, &frame_ipv6(&pkt), now_ms, rng)
+    }
+
+    /// [`Endpoint::ping_payload`] addressed by public key.
+    pub fn ping_key_payload(
+        &mut self,
+        key: &PublicKey,
+        id: u16,
+        seq: u16,
+        payload: &[u8],
+        now_ms: u64,
+        rng: &mut impl CryptoRngCore,
+    ) -> Vec<Action> {
+        let dest = address::addr_for_key(key);
+        self.ping_payload(&dest, id, seq, payload, now_ms, rng)
+    }
+
+    /// Set the measured round-trip time to a peer, in ms, used as its link weight in
+    /// tree parent selection.
+    pub fn set_link_latency(&mut self, key: PublicKey, rtt_ms: u64) {
+        self.node.set_link_latency(key, rtt_ms);
     }
 
     /// Accept TCP connections on these overlay ports from allowed keys, and report
@@ -397,6 +444,7 @@ impl Endpoint {
                     address: address::addr_for_key(&key),
                     rtt_ms,
                     up_ms: c.up_ms,
+                    lan: c.outbound && self.pool.slot_is_lan(slot),
                 })
             })
             .collect();

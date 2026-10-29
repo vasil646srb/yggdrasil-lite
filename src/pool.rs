@@ -76,6 +76,9 @@ pub struct PeerPool {
     slots: Vec<SlotState>,
     /// False while the first probe round runs: nothing is dialed until it is set back to true.
     dial_enabled: bool,
+    /// Slots `lan_from..` take only LAN-discovered candidates; the slots before it take
+    /// configured ones. `None`: every slot takes any candidate.
+    lan_from: Option<usize>,
 }
 
 impl PeerPool {
@@ -85,6 +88,34 @@ impl PeerPool {
             candidates: Vec::new(),
             slots: alloc::vec![SlotState::Idle; target_outbound],
             dial_enabled: true,
+            lan_from: None,
+        }
+    }
+
+    /// Create a pool with `public` slots for configured peers and `lan` slots that only
+    /// take LAN-discovered peers. LAN peers then never compete with public ones for slots.
+    pub fn with_lan_slots(public: usize, lan: usize) -> Self {
+        let mut p = Self::new(public + lan);
+        if lan > 0 {
+            p.lan_from = Some(public);
+        }
+        p
+    }
+
+    /// Whether `slot` may dial a candidate from `source`.
+    fn accepts(&self, slot: SlotId, source: CandidateSource) -> bool {
+        match self.lan_from {
+            None => true,
+            Some(k) if slot >= k => source == CandidateSource::Discovered,
+            Some(_) => source == CandidateSource::Config,
+        }
+    }
+
+    /// Whether the peer connected in `slot` was found by LAN discovery.
+    pub fn slot_is_lan(&self, slot: SlotId) -> bool {
+        match self.slots.get(slot) {
+            Some(SlotState::Up { cand, .. }) => self.candidates[*cand].source == CandidateSource::Discovered,
+            _ => false,
         }
     }
 
@@ -164,16 +195,17 @@ impl PeerPool {
             if self.slots[slot] != SlotState::Idle {
                 continue;
             }
-            let Some(best) = self.best_candidate(now_ms) else { break };
+            let Some(best) = self.best_candidate(slot, now_ms) else { continue };
             self.slots[slot] = SlotState::Dialing { cand: best, since_ms: now_ms };
             dials.push((slot, self.candidates[best].uri.clone()));
         }
         dials
     }
 
-    /// Best candidate that is off backoff and not already in a slot.
-    fn best_candidate(&self, now_ms: u64) -> Option<usize> {
+    /// Best candidate for `slot` that is off backoff and not already in a slot.
+    fn best_candidate(&self, slot: SlotId, now_ms: u64) -> Option<usize> {
         (0..self.candidates.len())
+            .filter(|&i| self.accepts(slot, self.candidates[i].source))
             .filter(|&i| self.candidates[i].next_try_ms <= now_ms)
             .filter(|&i| !self.slots.iter().any(|s| slot_uses(s, i)))
             .min_by_key(|&i| self.candidates[i].score())
@@ -390,5 +422,43 @@ mod tests {
         p.record_probe(&uri("tcp://dead.example:1514"), None);
         let d = p.schedule(0);
         assert_eq!(d[0].1.host_port(), "ok.example:1514");
+    }
+}
+
+#[cfg(test)]
+mod lan_slot_tests {
+    use super::*;
+
+    fn uri(s: &str) -> TcpPeerUri {
+        TcpPeerUri::parse(s).unwrap()
+    }
+
+    #[test]
+    fn lan_slot_takes_discovered_and_public_slot_skips_it() {
+        let mut p = PeerPool::with_lan_slots(1, 1);
+        p.add_candidate(uri("tcp://203.0.113.9:1514"), CandidateSource::Config);
+        p.add_candidate(uri("tcp://10.0.0.5:1514"), CandidateSource::Discovered);
+        let dials = p.schedule(0);
+        assert_eq!(dials.len(), 2);
+        assert_eq!(dials[0].0, 0, "public slot takes the configured peer");
+        assert_eq!(dials[1].0, 1, "LAN slot takes the discovered peer");
+    }
+
+    #[test]
+    fn lan_candidate_dials_even_when_public_candidates_are_faster() {
+        let mut p = PeerPool::with_lan_slots(1, 1);
+        p.add_candidate_with_rtt(uri("tcp://203.0.113.9:1514"), CandidateSource::Config, Some(1));
+        p.add_candidate(uri("tcp://10.0.0.5:1514"), CandidateSource::Discovered);
+        let dials = p.schedule(0);
+        assert!(dials.iter().any(|(slot, _)| *slot == 1), "LAN slot must still be filled");
+    }
+
+    #[test]
+    fn public_slot_idle_without_configured_candidates() {
+        let mut p = PeerPool::with_lan_slots(1, 1);
+        p.add_candidate(uri("tcp://10.0.0.5:1514"), CandidateSource::Discovered);
+        let dials = p.schedule(0);
+        assert_eq!(dials.len(), 1);
+        assert_eq!(dials[0].0, 1);
     }
 }

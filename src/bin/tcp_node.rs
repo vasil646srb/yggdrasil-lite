@@ -41,7 +41,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::io::{ErrorKind, Read, Write};
-use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV6, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -71,6 +71,28 @@ const ALLOW_PROBE_SEQ: u16 = 3;
 const ALLOW_PROBE_INTERVAL: Duration = Duration::from_secs(10);
 /// How often each connected peer is pinged for its latency.
 const PEER_PROBE_INTERVAL: Duration = Duration::from_secs(10);
+/// Random payload carried by a quality probe; a reply counts only if it echoes it back.
+type ProbeNonce = [u8; 8];
+
+fn new_nonce(rng: &mut impl RngCore) -> ProbeNonce {
+    let mut n = [0u8; 8];
+    rng.fill_bytes(&mut n);
+    n
+}
+
+/// Match a reply against the pending probe for `key` and consume it. Returns the send
+/// time only when the echoed payload equals the nonce that was sent.
+fn take_probe(map: &mut HashMap<PublicKey, (u64, ProbeNonce)>, key: &PublicKey, payload: &[u8]) -> Option<u64> {
+    match map.get(key) {
+        Some((sent, nonce)) if nonce.as_slice() == payload => {
+            let sent = *sent;
+            map.remove(key);
+            Some(sent)
+        }
+        _ => None,
+    }
+}
+
 /// A peer dropped for being on another root is not redialed for this long.
 const FOREIGN_COOLDOWN_MS: u64 = 30 * 60 * 1000;
 /// UDP forwarding: sessions per (client key, client port, overlay port), idle timeout,
@@ -97,7 +119,10 @@ const FIRST_PROBE_MAX_WAIT: Duration = Duration::from_secs(60);
 
 /// TCP connect time to the candidate's address over the regular internet, or `None` on failure.
 fn probe_tcp(uri: &TcpPeerUri) -> Option<u64> {
-    let addr = uri.host_port().to_socket_addrs().ok()?.next()?;
+    let addr = match uri.expected_key().and_then(|k| lan_scoped_addr(&k)) {
+        Some(sa) => SocketAddr::V6(sa),
+        None => uri.host_port().to_socket_addrs().ok()?.next()?,
+    };
     let t0 = Instant::now();
     let stream = TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).ok()?;
     let rtt = t0.elapsed().as_millis() as u64;
@@ -125,10 +150,6 @@ fn spawn_probe_round(uris: Vec<TcpPeerUri>, tx: &mpsc::Sender<(TcpPeerUri, Optio
 /// LAN discovery: multicast group and UDP port for beacons.
 /// yggdrasil-ng uses IPv6 link-local multicast; the URI parser has no zone-id support,
 /// so this build uses IPv4 multicast and advertises plain IPv4 addresses.
-const LAN_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 7);
-const LAN_PORT: u16 = 9001;
-const LAN_MAGIC: &[u8; 4] = b"YGGL";
-const LAN_BEACON_INTERVAL: Duration = Duration::from_secs(3);
 /// Upper bound for accepted inbound connections (on top of `--target`).
 const MAX_INBOUND: usize = 16;
 /// Root latency above this (ms) triggers replacement of the slowest outbound peer.
@@ -145,6 +166,7 @@ const SLOW_PEER_COOLDOWN_MS: u64 = 15 * 60 * 1000;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use yggdrasil_lite::icmp::{self, ECHO_REPLY};
+use yggdrasil_lite::peerlist::DEFAULT_PUBLIC_PEERS_URL;
 use yggdrasil_lite::uri::TcpPeerUri;
 use yggdrasil_lite::forward::{self, Event as FwdEvent};
 use yggdrasil_lite::quality::{PeerView, Quality, Verdict, DEFAULT_RECHECK_MS};
@@ -167,8 +189,12 @@ struct Args {
     send_udp: Option<(Ipv6Addr, u16, String)>,
     /// `--forward-udp`: (overlay port, local port) pairs for UDP.
     forwards_udp: Vec<(u16, u16)>,
-    /// `--lan`: discover peers on the local network by multicast beacons.
-    lan: bool,
+    /// `--lan-upstream`: discover yggdrasil-go peers via their IPv6 link-local beacons (dial over TLS).
+    lan_upstream: bool,
+    /// `--no-public`: do not download the public peer list; use only `--peers FILE` and LAN discovery.
+    no_public: bool,
+    /// `--lan-target`: outbound slots reserved for LAN peers (default: `--target`).
+    lan_target: Option<usize>,
     /// `--listen PORT`: accept inbound TCP peers and advertise this port in beacons.
     listen: Option<u16>,
 }
@@ -182,12 +208,12 @@ const DEFAULT_PAGE: &str = "<!doctype html>
 ";
 
 fn usage() -> ! {
-    eprintln!("usage: tcp_node --key FILE [--peers FILE] [--allow HEXKEY]... [--target N] [--ping IPV6] [--send IPV6 MESSAGE] [--html FILE] [--api ADDR] [--quality-interval SECS] [--forward PORT[:LOCAL],...] [--forward-udp PORT[:LOCAL],...] [--listen PORT] [--lan]");
+    eprintln!("usage: tcp_node --key FILE [--peers FILE] [--allow HEXKEY]... [--target N] [--ping IPV6] [--send IPV6 MESSAGE] [--html FILE] [--api ADDR] [--quality-interval SECS] [--forward PORT[:LOCAL],...] [--forward-udp PORT[:LOCAL],...] [--listen PORT] [--lan-upstream] [--no-public] [--lan-target N]");
     std::process::exit(2);
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { key: String::new(), peers: None, allow: Vec::new(), target: 3, send: None, ping: None, html: None, api: None, quality_ms: DEFAULT_RECHECK_MS, forwards: Vec::new(), forwards_udp: Vec::new(), send_udp: None, lan: false, listen: None };
+    let mut a = Args { key: String::new(), peers: None, allow: Vec::new(), target: 3, send: None, ping: None, html: None, api: None, quality_ms: DEFAULT_RECHECK_MS, forwards: Vec::new(), forwards_udp: Vec::new(), send_udp: None, lan_upstream: false, no_public: false, listen: None, lan_target: None };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         match flag.as_str() {
@@ -225,7 +251,9 @@ fn parse_args() -> Args {
                 let msg = it.next().unwrap_or_else(|| usage());
                 a.send_udp = Some((addr, port, msg));
             }
-            "--lan" => a.lan = true,
+            "--lan-upstream" => a.lan_upstream = true,
+            "--no-public" => a.no_public = true,
+            "--lan-target" => a.lan_target = Some(it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
             "--listen" => a.listen = Some(it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
             "--ping" => a.ping = Some(it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
             "--send" => {
@@ -304,6 +332,21 @@ fn unhex(s: &str) -> Result<Vec<u8>, Box<dyn Error>> {
         .collect()
 }
 
+/// Fetch the public peer list with `curl` (HTTPS is not built into this binary).
+fn download_public_peers() -> Result<Vec<u8>, Box<dyn Error>> {
+    let out = std::process::Command::new("curl")
+        .args(["-fsSL", "--max-time", "30", DEFAULT_PUBLIC_PEERS_URL])
+        .output()
+        .map_err(|e| format!("cannot run curl: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("curl failed ({}): {}", out.status, String::from_utf8_lossy(&out.stderr).trim()).into());
+    }
+    if out.stdout.is_empty() {
+        return Err("empty response".into());
+    }
+    Ok(out.stdout)
+}
+
 /// Read the 32-byte seed from `path`, creating it with fresh randomness if absent.
 ///
 /// The file is created with mode 0600 and never overwritten. An existing file
@@ -336,36 +379,186 @@ fn load_or_create_seed(path: &str) -> Result<[u8; 32], Box<dyn Error>> {
 }
 
 /// Execute actions, feeding transport results back into the endpoint.
-fn run(actions: Vec<Action>, ep: &mut Endpoint, streams: &mut HashMap<usize, TcpStream>, now: u64) {
+/// A peer connection: plain TCP, or TLS as a client (dialing upstream LAN peers).
+enum Stream {
+    Plain(TcpStream),
+    #[cfg(feature = "upstream-tls")]
+    Tls(Box<native_tls::TlsStream<TcpStream>>),
+}
+
+impl Read for Stream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Plain(s) => s.read(buf),
+            #[cfg(feature = "upstream-tls")]
+            Stream::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Plain(s) => s.write(buf),
+            #[cfg(feature = "upstream-tls")]
+            Stream::Tls(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Stream::Plain(s) => s.flush(),
+            #[cfg(feature = "upstream-tls")]
+            Stream::Tls(s) => s.flush(),
+        }
+    }
+}
+
+impl Stream {
+    fn shutdown(&mut self) {
+        match self {
+            Stream::Plain(s) => {
+                let _ = s.shutdown(Shutdown::Both);
+            }
+            #[cfg(feature = "upstream-tls")]
+            Stream::Tls(s) => {
+                let _ = s.shutdown();
+                let _ = s.get_ref().shutdown(Shutdown::Both);
+            }
+        }
+    }
+}
+
+/// Upstream LAN peers found by beacon: key -> scoped link-local address (with the interface id).
+/// Shared between the probe threads and the dialer, which otherwise only see URIs without zone ids.
+static LAN_SCOPED: Mutex<Vec<(PublicKey, SocketAddrV6)>> = Mutex::new(Vec::new());
+
+fn lan_scoped_set(key: PublicKey, addr: SocketAddrV6) {
+    if let Ok(mut v) = LAN_SCOPED.lock() {
+        match v.iter_mut().find(|(k, _)| *k == key) {
+            Some(entry) => entry.1 = addr,
+            None => v.push((key, addr)),
+        }
+    }
+}
+
+fn lan_scoped_addr(key: &PublicKey) -> Option<SocketAddrV6> {
+    LAN_SCOPED.lock().ok()?.iter().find(|(k, _)| k == key).map(|(_, a)| *a)
+}
+
+/// Open a connection for a candidate. Upstream LAN peers go over TLS to their scoped address;
+/// everything else is a plain TCP connection as before.
+fn dial_slot(uri: &TcpPeerUri) -> Option<Stream> {
+    if let Some(key) = uri.expected_key() {
+        if let Some(sa) = lan_scoped_addr(&key) {
+            let s = dial_lan_tls(SocketAddr::V6(sa));
+            if s.is_none() {
+                eprintln!("lan: dial {sa} failed");
+            }
+            return s;
+        }
+    }
+    if uri.is_tls() {
+        return dial_public_tls(uri);
+    }
+    let addr = uri.host_port().to_socket_addrs().ok()?.next()?;
+    let s = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).ok()?;
+    let _ = s.set_nodelay(true);
+    // Blocking writes with a timeout; reads poll with a short timeout.
+    let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
+    let _ = s.set_read_timeout(Some(Duration::from_millis(1)));
+    Some(Stream::Plain(s))
+}
+
+/// `tls://` peer from a public list: TLS to the resolved address, SNI and name from the URI.
+#[cfg(feature = "upstream-tls")]
+fn dial_public_tls(uri: &TcpPeerUri) -> Option<Stream> {
+    let addr = uri.host_port().to_socket_addrs().ok()?.next()?;
+    match upstream_tls::connect(addr, uri.host()) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("tls: {uri}: {e}");
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "upstream-tls"))]
+fn dial_public_tls(uri: &TcpPeerUri) -> Option<Stream> {
+    eprintln!("tls: {uri} skipped: build with `--features upstream-tls`");
+    None
+}
+
+#[cfg(feature = "upstream-tls")]
+fn dial_lan_tls(addr: SocketAddr) -> Option<Stream> {
+    match upstream_tls::connect(addr, "localhost") {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("lan: TLS to {addr}: {e}");
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "upstream-tls"))]
+fn dial_lan_tls(_addr: SocketAddr) -> Option<Stream> {
+    // Built without `upstream-tls`: upstream peers cannot be dialed, so the candidate fails.
+    None
+}
+
+#[cfg(feature = "upstream-tls")]
+mod upstream_tls {
+    use super::Stream;
+    use std::error::Error;
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    /// Dial over TLS (system OpenSSL via native-tls). The certificate and hostname are not
+    /// checked, as yggdrasil-go does (InsecureSkipVerify); peer identity comes from the signed
+    /// meta-handshake that follows. TLS 1.2 is the minimum, TLS 1.3 is used when both sides support it.
+    pub fn connect(addr: SocketAddr, name: &str) -> Result<Stream, Box<dyn Error>> {
+        let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+        let _ = tcp.set_nodelay(true);
+        let _ = tcp.set_write_timeout(Some(Duration::from_secs(5)));
+        let _ = tcp.set_read_timeout(Some(Duration::from_secs(5)));
+
+        let connector = native_tls::TlsConnector::builder()
+            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true)
+            .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
+            .build()?;
+        // The name is used for SNI only: the certificate is not verified.
+        let tls = connector
+            .connect(name, tcp)
+            .map_err(|e| format!("TLS handshake: {e}"))?;
+        // Polled mode for the main loop: reads return after 1 ms when there is no data.
+        let _ = tls.get_ref().set_read_timeout(Some(Duration::from_millis(1)));
+        Ok(Stream::Tls(Box::new(tls)))
+    }
+}
+
+fn run(actions: Vec<Action>, ep: &mut Endpoint, streams: &mut HashMap<usize, Stream>, now: u64) {
     let mut queue: VecDeque<Action> = actions.into();
     while let Some(action) = queue.pop_front() {
         match action {
-            Action::Dial { slot, uri } => {
-                let addr = uri.host_port().to_socket_addrs().ok().and_then(|mut it| it.next());
-                let stream = addr.and_then(|a| TcpStream::connect_timeout(&a, Duration::from_secs(5)).ok());
-                match stream {
-                    Some(s) => {
-                        let _ = s.set_nodelay(true);
-                        // Blocking writes with a timeout; reads poll with a short timeout.
-                        let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
-                        let _ = s.set_read_timeout(Some(Duration::from_millis(1)));
-                        streams.insert(slot, s);
-                        queue.extend(ep.on_transport_up(slot, now));
-                    }
-                    None => ep.on_transport_failed(slot, now),
+            Action::Dial { slot, uri } => match dial_slot(&uri) {
+                Some(stream) => {
+                    streams.insert(slot, stream);
+                    queue.extend(ep.on_transport_up(slot, now));
                 }
-            }
+                None => ep.on_transport_failed(slot, now),
+            },
             Action::Write { slot, data } => {
                 if let Some(s) = streams.get_mut(&slot) {
-                    if s.write_all(&data).is_err() {
+                    if let Err(e) = s.write_all(&data) {
+                        eprintln!("write to slot {slot} failed: {e} ({:?})", e.kind());
                         streams.remove(&slot);
                         ep.on_transport_closed(slot, now);
                     }
                 }
             }
             Action::Close { slot } => {
-                if let Some(s) = streams.remove(&slot) {
-                    let _ = s.shutdown(Shutdown::Both);
+                if let Some(mut s) = streams.remove(&slot) {
+                    s.shutdown();
                 }
             }
         }
@@ -411,29 +604,76 @@ fn udp_inbound(
     }
 }
 
-/// Beacon: magic, our 32-byte public key, our listen port (big endian).
-fn lan_beacon(key: &PublicKey, port: u16) -> Vec<u8> {
-    let mut b = Vec::with_capacity(38);
-    b.extend_from_slice(LAN_MAGIC);
-    b.extend_from_slice(key);
-    b.extend_from_slice(&port.to_be_bytes());
-    b
-}
+/// yggdrasil-go LAN discovery: IPv6 link-local multicast group and port.
+const UPSTREAM_GROUP: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x0114);
+const UPSTREAM_BEACON_PORT: u16 = 9001;
 
-/// Parse a beacon; `None` for anything that is not a well-formed beacon.
-fn parse_lan_beacon(b: &[u8]) -> Option<(PublicKey, u16)> {
-    if b.len() != 38 || &b[..4] != LAN_MAGIC {
+/// Parse a yggdrasil-go beacon (big endian): major u16 (0), minor u16 (5), public key (32),
+/// listen port u16, hash length u16, hash. The hash is BLAKE2b-512 of the key with no password.
+/// Anything else (other version, bad hash, wrong length) is ignored.
+fn parse_upstream_beacon(b: &[u8]) -> Option<(PublicKey, u16)> {
+    if b.len() < 40 {
+        return None;
+    }
+    let major = u16::from_be_bytes([b[0], b[1]]);
+    let minor = u16::from_be_bytes([b[2], b[3]]);
+    if major != 0 || minor != 5 {
         return None;
     }
     let mut key = [0u8; 32];
     key.copy_from_slice(&b[4..36]);
-    Some((key, u16::from_be_bytes([b[36], b[37]])))
+    let port = u16::from_be_bytes([b[36], b[37]]);
+    let hash_len = u16::from_be_bytes([b[38], b[39]]) as usize;
+    if port == 0 || hash_len != 64 || b.len() != 40 + hash_len {
+        return None;
+    }
+    use blake2::{Blake2b512, Digest};
+    let mut hasher = Blake2b512::new();
+    hasher.update(key);
+    let expected = hasher.finalize();
+    if &b[40..] != expected.as_slice() {
+        return None;
+    }
+    Some((key, port))
 }
 
-fn lan_socket() -> Result<UdpSocket, Box<dyn Error>> {
-    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, LAN_PORT))?;
-    sock.join_multicast_v4(&LAN_GROUP, &Ipv4Addr::UNSPECIFIED)?;
-    sock.set_multicast_loop_v4(false)?;
+/// Interface indices to join the beacon group on. Android (Termux) denies apps read access to
+/// `/sys/class/net`, so sysfs is only a first try; otherwise probe small indices, since joining
+/// a non-existent index fails and a real one succeeds.
+fn lan_ifindices() -> Vec<u32> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir("/sys/class/net") {
+        for entry in rd.flatten() {
+            if entry.file_name().to_str() == Some("lo") {
+                continue;
+            }
+            if let Ok(t) = std::fs::read_to_string(entry.path().join("ifindex")) {
+                if let Ok(idx) = t.trim().parse::<u32>() {
+                    out.push(idx);
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        out = (1..=64).collect();
+    }
+    out
+}
+
+/// Listen for yggdrasil-go beacons on every interface we can join the group on.
+fn upstream_lan_socket() -> Result<UdpSocket, Box<dyn Error>> {
+    let sock = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, UPSTREAM_BEACON_PORT))
+        .map_err(|e| format!("bind [::]:{UPSTREAM_BEACON_PORT}: {e}"))?;
+    let mut joined = Vec::new();
+    for idx in lan_ifindices() {
+        if sock.join_multicast_v6(&UPSTREAM_GROUP, idx).is_ok() {
+            joined.push(idx);
+        }
+    }
+    if joined.is_empty() {
+        return Err(format!("could not join {UPSTREAM_GROUP} on any interface (tried sysfs and indices 1-64)").into());
+    }
+    println!("lan upstream:   joined {UPSTREAM_GROUP} on ifindex {joined:?}");
     sock.set_nonblocking(true)?;
     Ok(sock)
 }
@@ -467,12 +707,39 @@ fn print_peers(ep: &Endpoint, sockets: usize, now: u64) {
 fn main() -> Result<(), Box<dyn Error>> {
     let args = parse_args();
     let seed = load_or_create_seed(&args.key)?;
-    let mut ep = Endpoint::new(seed, None, args.target);
+    if let Some(n) = args.lan_target {
+        if !(1..=MAX_TARGET).contains(&n) {
+            eprintln!("--lan-target must be between 1 and {MAX_TARGET} (got {n})");
+            std::process::exit(2);
+        }
+    }
+    if args.lan_upstream && !cfg!(feature = "upstream-tls") {
+        eprintln!("--lan-upstream needs a build with `--features upstream-tls`");
+        std::process::exit(2);
+    }
+    let lan_slots = if args.lan_upstream { args.lan_target.unwrap_or(args.target) } else { 0 };
+    let mut ep = Endpoint::new_with_lan(seed, None, args.target, lan_slots);
 
-    if let Some(path) = &args.peers {
-        let json = std::fs::read(path)?;
-        let added = ep.import_peer_list(&json, CandidateSource::Config);
-        println!("imported {added} TCP peers from {path}");
+    match &args.peers {
+        Some(path) => {
+            let json = std::fs::read(path)?;
+            let added = ep.import_peer_list(&json, CandidateSource::Config);
+            println!("imported {added} TCP peers from {path}");
+        }
+        None if args.no_public => {
+            println!("peers:          no public list (--no-public): LAN and --peers only");
+        }
+        None => {
+            // No --peers: fetch the public list. Failure is fatal, so the log shows why.
+            println!("peers:          downloading {DEFAULT_PUBLIC_PEERS_URL}");
+            let json = download_public_peers()
+                .map_err(|e| format!("peer list download failed: {e} (install curl, or pass --peers FILE)"))?;
+            let added = ep.import_peer_list(&json, CandidateSource::Config);
+            if added == 0 {
+                return Err(format!("downloaded peer list has no usable TCP peers ({} bytes)", json.len()).into());
+            }
+            println!("imported {added} TCP peers from {DEFAULT_PUBLIC_PEERS_URL}");
+        }
     }
     let allow_keys: Vec<PublicKey> = args.allow.iter().map(|k| parse_key(k)).collect::<Result<_, _>>()?;
     for k in &allow_keys {
@@ -511,12 +778,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     let addr = Address(ep.address().0);
     println!("device address: {}", Ipv6Addr::from(addr.0));
     println!("public key:     {}", hex(ep.public_key()));
-    println!("outbound peers: {} (--target)", args.target);
+    if lan_slots > 0 {
+        println!("outbound peers: {} (--target) + {lan_slots} (LAN)", args.target);
+    } else {
+        println!("outbound peers: {} (--target)", args.target);
+    }
     println!("allowed keys:   {}", args.allow.len());
     println!("web page:       http://[{}]/", Ipv6Addr::from(addr.0));
 
     let mut rng = OsRng;
-    let mut streams: HashMap<usize, TcpStream> = HashMap::new();
+    let mut streams: HashMap<usize, Stream> = HashMap::new();
     let start = Instant::now();
     // Start the protocol clock away from zero, as the library tests do.
     let clock = |start: Instant| CLOCK_BASE + start.elapsed().as_millis() as u64;
@@ -534,11 +805,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let probe_start = Instant::now();
     ep.set_dial_enabled(false);
     let mut last_swap = Instant::now() - SWAP_MIN_INTERVAL;
-    let mut allow_sent: HashMap<PublicKey, u64> = HashMap::new();
+    let mut allow_sent: HashMap<PublicKey, (u64, ProbeNonce)> = HashMap::new();
     let mut last_allow_probe = Instant::now() - ALLOW_PROBE_INTERVAL;
     overlay.allow_keys = allow_keys.clone();
-    let mut probe_sent: HashMap<PublicKey, u64> = HashMap::new();
-    let mut root_probe: Option<(PublicKey, u64)> = None;
+    let mut probe_sent: HashMap<PublicKey, (u64, ProbeNonce)> = HashMap::new();
+    let mut root_probe: Option<(PublicKey, u64, ProbeNonce)> = None;
     let mut last_probe = Instant::now() - PEER_PROBE_INTERVAL;
     let mut fwd_streams: HashMap<u32, TcpStream> = HashMap::new();
     let mut fwd_eof: HashSet<u32> = HashSet::new();
@@ -552,47 +823,59 @@ fn main() -> Result<(), Box<dyn Error>> {
     for (overlay, local) in &args.forwards_udp {
         println!("forward udp:    overlay port {overlay} -> 127.0.0.1:{local}");
     }
-    let lan = if args.lan { Some(lan_socket()?) } else { None };
-    let mut last_beacon = Instant::now() - LAN_BEACON_INTERVAL;
-    let listener = match args.listen {
-        Some(port) => {
-            let l = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))?;
-            l.set_nonblocking(true)?;
-            println!("listen:         tcp 0.0.0.0:{port} (inbound, max {MAX_INBOUND})");
-            Some(l)
+    let upstream_sock = if args.lan_upstream {
+        match upstream_lan_socket() {
+            Ok(s) => {
+                println!("lan upstream:   [{}]:{} (listen only, TLS dial)", UPSTREAM_GROUP, UPSTREAM_BEACON_PORT);
+                Some(s)
+            }
+            Err(e) => {
+                eprintln!("lan upstream: disabled: {e}");
+                None
+            }
         }
+    } else {
+        None
+    };
+    let listener = match args.listen {
+        Some(port) => match TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)) {
+            Ok(l) => {
+                l.set_nonblocking(true)?;
+                println!("listen:         tcp 0.0.0.0:{port} (inbound, max {MAX_INBOUND})");
+                Some(l)
+            }
+            Err(e) => {
+                eprintln!("listen: disabled, cannot bind TCP {port}: {e}");
+                None
+            }
+        },
         None => None,
     };
-    if args.lan {
-        println!("lan discovery:  {LAN_GROUP}:{LAN_PORT} (beacon every {}s)", LAN_BEACON_INTERVAL.as_secs());
-    }
 
     loop {
         let now = clock(start);
         let actions = ep.poll(now, &mut rng);
         run(actions, &mut ep, &mut streams, now);
 
-        // LAN discovery: send our beacon, read others and add them as pinned candidates.
-        if let Some(sock) = lan.as_ref() {
-            if let Some(port) = args.listen {
-                if last_beacon.elapsed() >= LAN_BEACON_INTERVAL {
-                    last_beacon = Instant::now();
-                    let _ = sock.send_to(&lan_beacon(ep.public_key(), port), (LAN_GROUP, LAN_PORT));
-                }
-            }
-            let mut buf = [0u8; 64];
+        // yggdrasil-go LAN beacons: listen only, never send. Each beacon's source is a link-local
+        // address whose scope id is the interface; keep it so we can dial that exact address.
+        if let Some(sock) = upstream_sock.as_ref() {
+            let mut buf = [0u8; 128];
             while let Ok((n, src)) = sock.recv_from(&mut buf) {
-                let Some((key, port)) = parse_lan_beacon(&buf[..n]) else { continue };
+                let Some((key, port)) = parse_upstream_beacon(&buf[..n]) else { continue };
                 if key == *ep.public_key() {
                     continue;
                 }
-                if let SocketAddr::V4(v4) = src {
-                    let uri = format!("tcp://{}:{}?key={}", v4.ip(), port, hex(&key));
-                    match ep.add_peer_uri(&uri, CandidateSource::Discovered) {
-                        Ok(true) => println!("lan: discovered {uri}"),
-                        Ok(false) => {}
-                        Err(e) => println!("lan: bad beacon from {src}: {e:?}"),
-                    }
+                let SocketAddr::V6(v6) = src else { continue };
+                if v6.ip().segments()[0] & 0xffc0 != 0xfe80 || v6.scope_id() == 0 {
+                    continue;
+                }
+                lan_scoped_set(key, SocketAddrV6::new(*v6.ip(), port, 0, v6.scope_id()));
+                let uri = format!("tcp://[{}]:{}?key={}", v6.ip(), port, hex(&key));
+                match ep.add_peer_uri(&uri, CandidateSource::Discovered) {
+                    Ok(true) => println!("lan: discovered upstream {} (scope {})", uri, v6.scope_id()),
+                    Ok(false) => {}
+                    Err(e) => println!("lan: bad upstream beacon from {src}: {e:?}"),
                 }
             }
         }
@@ -600,7 +883,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         // Inbound TCP peers (only when --listen is set).
         if let Some(l) = listener.as_ref() {
             while let Ok((stream, from)) = l.accept() {
-                if streams.len() >= args.target + MAX_INBOUND {
+                if streams.len() >= args.target + lan_slots + MAX_INBOUND {
                     drop(stream);
                     continue;
                 }
@@ -609,7 +892,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
                 let _ = stream.set_read_timeout(Some(Duration::from_millis(1)));
                 let (slot, acts) = ep.accept_transport(now);
-                streams.insert(slot, stream);
+                streams.insert(slot, Stream::Plain(stream));
                 run(acts, &mut ep, &mut streams, now);
                 println!("inbound from {from}");
             }
@@ -668,6 +951,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             };
             match read {
                 Ok(0) => {
+                    println!("peer slot {slot}: closed by remote (EOF) at {now} ms");
                     streams.remove(&slot);
                     ep.on_transport_closed(slot, now);
                 }
@@ -676,7 +960,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     run(actions, &mut ep, &mut streams, now);
                 }
                 Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => {}
-                Err(_) => {
+                Err(e) => {
+                    println!("peer slot {slot}: read error at {now} ms: {e} ({:?})", e.kind());
                     streams.remove(&slot);
                     ep.on_transport_closed(slot, now);
                 }
@@ -689,19 +974,22 @@ fn main() -> Result<(), Box<dyn Error>> {
                 if echo.kind == ECHO_REPLY && echo.id == QUALITY_ID {
                     match echo.seq {
                         PEER_PROBE_SEQ => {
-                            if let Some(sent) = probe_sent.remove(&msg.from_key) {
+                            if let Some(sent) = take_probe(&mut probe_sent, &msg.from_key, &echo.payload) {
                                 quality.record_rtt(&msg.from_key, now.saturating_sub(sent));
+                                if let Some(rtt) = quality.rtt(&msg.from_key) {
+                                    ep.set_link_latency(msg.from_key, rtt);
+                                }
                             }
                         }
                         ALLOW_PROBE_SEQ => {
-                            if let Some(sent) = allow_sent.remove(&msg.from_key) {
+                            if let Some(sent) = take_probe(&mut allow_sent, &msg.from_key, &echo.payload) {
                                 let sample = now.saturating_sub(sent);
                                 overlay.allow_rtt.insert(msg.from_key, (sample, now));
                             }
                         }
                         ROOT_PROBE_SEQ => {
-                            if let Some((root, sent)) = root_probe {
-                                if root == msg.from_key {
+                            if let Some((root, sent, nonce)) = root_probe {
+                                if root == msg.from_key && nonce.as_slice() == echo.payload.as_slice() {
                                     quality.record_root_rtt(now.saturating_sub(sent));
                                     root_probe = None;
                                 }
@@ -776,7 +1064,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let snap = snapshot(&ep, clock(start));
             // Overlay page (port 80 over Yggdrasil): the live stats, unless the user gave --html.
             if args.html.is_none() {
-                ep.serve_http(status_page(&ep, &quality, &overlay, args.target, clock(start)).into_bytes());
+                ep.serve_http(status_page(&ep, &quality, &overlay, args.target + lan_slots, clock(start)).into_bytes());
             }
             if args.api.is_some() {
                 *shared.lock().unwrap() = snap;
@@ -875,8 +1163,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         if last_probe.elapsed() >= PEER_PROBE_INTERVAL {
             last_probe = Instant::now();
             for p in ep.connected_peers().into_iter().filter(|p| p.direction == Direction::Outbound) {
-                probe_sent.insert(p.key, now);
-                let acts = ep.ping_key(&p.key, QUALITY_ID, PEER_PROBE_SEQ, now, &mut rng);
+                let nonce = new_nonce(&mut rng);
+                probe_sent.insert(p.key, (now, nonce));
+                let acts = ep.ping_key_payload(&p.key, QUALITY_ID, PEER_PROBE_SEQ, &nonce, now, &mut rng);
                 run(acts, &mut ep, &mut streams, now);
             }
         }
@@ -885,8 +1174,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             last_allow_probe = Instant::now();
             let me = *ep.public_key();
             for k in allow_keys.iter().filter(|k| **k != me) {
-                allow_sent.insert(*k, now);
-                let acts = ep.ping(&addr_for_key(k), QUALITY_ID, ALLOW_PROBE_SEQ, now, &mut rng);
+                let nonce = new_nonce(&mut rng);
+                allow_sent.insert(*k, (now, nonce));
+                let acts = ep.ping_payload(&addr_for_key(k), QUALITY_ID, ALLOW_PROBE_SEQ, &nonce, now, &mut rng);
                 run(acts, &mut ep, &mut streams, now);
             }
         }
@@ -948,8 +1238,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             if overlay.searching && root_probe.is_none() && search_probe.elapsed() >= SEARCH_PROBE_INTERVAL {
                 if let Some(root) = overlay.root.filter(|r| *r != me) {
                     search_probe = Instant::now();
-                    root_probe = Some((root, now));
-                    let acts = ep.ping_key(&root, QUALITY_ID, ROOT_PROBE_SEQ, now, &mut rng);
+                    let nonce = new_nonce(&mut rng);
+                    root_probe = Some((root, now, nonce));
+                    let acts = ep.ping_key_payload(&root, QUALITY_ID, ROOT_PROBE_SEQ, &nonce, now, &mut rng);
                     run(acts, &mut ep, &mut streams, now);
                 }
             }
@@ -993,8 +1284,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 if let Some(root) = verdict.global_root {
                     if root != *ep.public_key() {
-                        root_probe = Some((root, now));
-                        let acts = ep.ping_key(&root, QUALITY_ID, ROOT_PROBE_SEQ, now, &mut rng);
+                        let nonce = new_nonce(&mut rng);
+                        root_probe = Some((root, now, nonce));
+                        let acts = ep.ping_key_payload(&root, QUALITY_ID, ROOT_PROBE_SEQ, &nonce, now, &mut rng);
                         run(acts, &mut ep, &mut streams, now);
                     }
                 }
@@ -1040,7 +1332,7 @@ fn esc(s: &str) -> String {
 fn worst_outbound(ep: &Endpoint, quality: &Quality) -> Option<PublicKey> {
     ep.connected_peers()
         .into_iter()
-        .filter(|p| p.direction == Direction::Outbound)
+        .filter(|p| p.direction == Direction::Outbound && !p.lan)
         .filter_map(|p| quality.rtt(&p.key).or(p.rtt_ms).map(|r| (r, p.key)))
         .max_by_key(|(r, _)| *r)
         .map(|(_, k)| k)
@@ -1327,24 +1619,61 @@ mod status_page_tests {
 }
 
 #[cfg(test)]
-mod lan_beacon_tests {
+mod probe_nonce_tests {
     use super::*;
 
     #[test]
-    fn beacon_round_trip() {
-        let key = [0x42u8; 32];
-        let b = lan_beacon(&key, 9000);
-        assert_eq!(b.len(), 38);
-        assert_eq!(parse_lan_beacon(&b), Some((key, 9000)));
+    fn reply_counts_only_with_matching_nonce() {
+        let key = [3u8; 32];
+        let mut map: HashMap<PublicKey, (u64, ProbeNonce)> = HashMap::new();
+        map.insert(key, (1_000, [1, 2, 3, 4, 5, 6, 7, 8]));
+
+        // A reply that does not echo the nonce is ignored and leaves the probe pending.
+        assert_eq!(take_probe(&mut map, &key, &[0u8; 8]), None);
+        assert!(map.contains_key(&key));
+
+        // The matching echo completes it once.
+        assert_eq!(take_probe(&mut map, &key, &[1, 2, 3, 4, 5, 6, 7, 8]), Some(1_000));
+        assert_eq!(take_probe(&mut map, &key, &[1, 2, 3, 4, 5, 6, 7, 8]), None);
+    }
+}
+
+#[cfg(test)]
+mod upstream_beacon_tests {
+    use super::*;
+    use blake2::{Blake2b512, Digest};
+
+    fn beacon(key: &PublicKey, port: u16) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&5u16.to_be_bytes());
+        b.extend_from_slice(key);
+        b.extend_from_slice(&port.to_be_bytes());
+        let mut h = Blake2b512::new();
+        h.update(key);
+        let hash = h.finalize();
+        b.extend_from_slice(&64u16.to_be_bytes());
+        b.extend_from_slice(hash.as_slice());
+        b
     }
 
     #[test]
-    fn rejects_malformed_beacons() {
-        let key = [1u8; 32];
-        let mut bad_magic = lan_beacon(&key, 1);
-        bad_magic[0] = b'X';
-        assert_eq!(parse_lan_beacon(&bad_magic), None);
-        assert_eq!(parse_lan_beacon(&lan_beacon(&key, 1)[..37]), None);
-        assert_eq!(parse_lan_beacon(&[]), None);
+    fn upstream_beacon_round_trip() {
+        let key = [7u8; 32];
+        assert_eq!(parse_upstream_beacon(&beacon(&key, 9001)), Some((key, 9001)));
+    }
+
+    #[test]
+    fn upstream_beacon_rejects_bad_input() {
+        let key = [7u8; 32];
+        let mut wrong_version = beacon(&key, 9001);
+        wrong_version[3] = 4;
+        assert_eq!(parse_upstream_beacon(&wrong_version), None);
+        let mut bad_hash = beacon(&key, 9001);
+        let last = bad_hash.len() - 1;
+        bad_hash[last] ^= 1;
+        assert_eq!(parse_upstream_beacon(&bad_hash), None);
+        assert_eq!(parse_upstream_beacon(&beacon(&key, 9001)[..50]), None);
+        assert_eq!(parse_upstream_beacon(&beacon(&key, 0)), None);
     }
 }

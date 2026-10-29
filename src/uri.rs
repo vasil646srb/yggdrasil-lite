@@ -1,8 +1,9 @@
-//! TCP-only peer URIs.
+//! Peer URIs for the two stream transports the lite node speaks.
 //!
-//! The lite node accepts exactly one transport: `tcp://host:port`, where
-//! `host` is an IPv4 address, a bracketed IPv6 address (`tcp://[2001:db8::1]:1514`)
-//! or a DNS name. Other schemes (`tls://`, `ws://`, `quic://`, …) are rejected.
+//! `tcp://host:port` and `tls://host:port`, where `host` is an IPv4 address, a
+//! bracketed IPv6 address (`tcp://[2001:db8::1]:1514`) or a DNS name. The scheme
+//! only selects whether the connection is wrapped in TLS by the caller; the
+//! handshake that follows is the same. Other schemes (`ws://`, `quic://`, …) are rejected.
 //!
 //! The only query option accepted is `?key=<64 hex chars>`: the peer's expected
 //! Ed25519 public key (as published in public peer lists). When present, the
@@ -12,7 +13,7 @@
 use alloc::string::{String, ToString};
 use core::fmt;
 
-/// A parsed `tcp://` peer endpoint.
+/// A parsed `tcp://` or `tls://` peer endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TcpPeerUri {
     /// Host without brackets (IPv6 literal stored without `[`/`]`).
@@ -20,6 +21,8 @@ pub struct TcpPeerUri {
     port: u16,
     /// Expected peer public key, if known.
     key: Option<[u8; 32]>,
+    /// `tls://` scheme: the caller wraps the stream in TLS before the handshake.
+    tls: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,10 +52,16 @@ impl fmt::Display for UriError {
 }
 
 impl TcpPeerUri {
-    /// Parse `tcp://host:port[?key=<hex>]` (case-insensitive scheme, surrounding whitespace ignored).
+    /// Parse `tcp://host:port[?key=<hex>]` or `tls://...` (case-insensitive scheme, surrounding whitespace ignored).
     pub fn parse(input: &str) -> Result<Self, UriError> {
         let s = input.trim();
-        let rest = strip_prefix_ci(s, "tcp://").ok_or(UriError::UnsupportedScheme)?;
+        let (rest, tls) = if let Some(r) = strip_prefix_ci(s, "tcp://") {
+            (r, false)
+        } else if let Some(r) = strip_prefix_ci(s, "tls://") {
+            (r, true)
+        } else {
+            return Err(UriError::UnsupportedScheme);
+        };
         if rest.contains('/') || rest.contains('#') {
             return Err(UriError::UnsupportedOption);
         }
@@ -94,7 +103,13 @@ impl TcpPeerUri {
             host: host.to_string(),
             port,
             key,
+            tls,
         })
+    }
+
+    /// `tls://` endpoint: the caller must wrap the connection in TLS.
+    pub fn is_tls(&self) -> bool {
+        self.tls
     }
 
     pub fn host(&self) -> &str {
@@ -128,7 +143,7 @@ impl TcpPeerUri {
 
 impl fmt::Display for TcpPeerUri {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "tcp://{}", self.host_port())?;
+        write!(f, "{}://{}", if self.tls { "tls" } else { "tcp" }, self.host_port())?;
         if let Some(k) = self.key {
             write!(f, "?key={}", hex32(&k))?;
         }
@@ -199,7 +214,8 @@ mod tests {
 
     #[test]
     fn rejects_non_tcp_and_bad_forms() {
-        assert_eq!(TcpPeerUri::parse("tls://1.2.3.4:443"), Err(UriError::UnsupportedScheme));
+        assert_eq!(TcpPeerUri::parse("quic://1.2.3.4:443"), Err(UriError::UnsupportedScheme));
+        assert!(TcpPeerUri::parse("tls://1.2.3.4:443").unwrap().is_tls());
         assert_eq!(TcpPeerUri::parse("ws://x:80"), Err(UriError::UnsupportedScheme));
         assert_eq!(TcpPeerUri::parse("tcp://1.2.3.4"), Err(UriError::BadPort));
         assert_eq!(TcpPeerUri::parse("tcp://1.2.3.4:0"), Err(UriError::BadPort));

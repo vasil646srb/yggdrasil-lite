@@ -15,6 +15,9 @@ rand_core = { version = "0.6", default-features = false }
 # Used by the tcp_node binary (src/bin). Plain Rust, no C dependencies.
 rand = "0.8"
 heapless = "0.8"
+# Optional: only for the upstream-tls feature (tcp_node --lan-upstream). Uses the system
+# OpenSSL/TLS library through native-tls, so it needs OpenSSL headers at build time.
+native-tls = { version = "0.2", optional = true }
 
 # TCP/IP stack (optional, replaces hand-rolled MiniTcp in lite_node example)
 smoltcp = { version = "0.12", optional = true, default-features = false, features = [
@@ -28,6 +31,9 @@ smoltcp = { version = "0.12", optional = true, default-features = false, feature
 [features]
 default = ["std"]
 std = []
+# Dial yggdrasil-go LAN peers over TLS (tcp_node --lan-upstream) via native-tls. Off by default
+# so the no_std library build never pulls it in.
+upstream-tls = ["dep:native-tls"]
 smoltcp = ["dep:smoltcp"]
 # Act as a transit node: merge peer bloom filters into advertisements,
 # forward PathLookup/PathNotify/PathBroken, and forward traffic between peers.

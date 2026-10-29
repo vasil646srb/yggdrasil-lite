@@ -1,12 +1,12 @@
 //! Public peer lists (`publicnodes.json` format).
 //!
 //! Structure: top-level object → region files (`"armenia.md": {...}`) → peer
-//! URIs as keys (`"tcp://host:port": {...}`) with metadata:
+//! URIs as keys (`"tcp://host:port": {...}` or `"tls://host:port": {...}`) with metadata:
 //! `up` (bool), `key` (hex public key), `response_ms` (number), plus fields the
 //! lite node ignores. Some URIs carry `?key=` in the key string itself.
 //!
 //! Policy:
-//! - only `tcp://` entries are imported;
+//! - only `tcp://` and `tls://` entries are imported;
 //! - entries with `"up": false` are skipped;
 //! - the peer's `key` pins the expected identity (the handshake must match);
 //! - `response_ms` seeds the candidate's latency estimate.
@@ -46,7 +46,7 @@ pub fn tcp_peers_from_json(json: &[u8]) -> Vec<PeerEntry> {
         let (s, next) = read_string(json, i);
         i = next;
         let Some(s) = s else { continue };
-        if !is_tcp_prefix(&s) {
+        if !is_peer_prefix(&s) {
             continue;
         }
         let Ok(uri) = TcpPeerUri::parse(&s) else { continue };
@@ -84,8 +84,9 @@ struct Fields {
     response_ms: Option<u64>,
 }
 
-fn is_tcp_prefix(s: &str) -> bool {
-    s.len() >= 6 && s.as_bytes()[..6].eq_ignore_ascii_case(b"tcp://")
+fn is_peer_prefix(s: &str) -> bool {
+    (s.len() >= 6 && s.as_bytes()[..6].eq_ignore_ascii_case(b"tcp://"))
+        || (s.len() >= 6 && s.as_bytes()[..6].eq_ignore_ascii_case(b"tls://"))
 }
 
 /// Read a JSON string starting at `start` (which must be `"`). Returns the
@@ -269,9 +270,10 @@ mod tests {
     #[test]
     fn plain_string_entries_are_accepted_without_metadata() {
         let peers = tcp_peers_from_json(br#"["tcp://a.example:1514", "tls://b.example:443"]"#);
-        assert_eq!(peers.len(), 1);
+        assert_eq!(peers.len(), 2);
         assert_eq!(peers[0].uri.to_string(), "tcp://a.example:1514");
         assert_eq!(peers[0].key, None);
         assert_eq!(peers[0].response_ms, None);
+        assert_eq!(peers[1].uri.to_string(), "tls://b.example:443");
     }
 }

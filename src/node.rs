@@ -10,6 +10,7 @@
 //! The node is **poll-based** and **synchronous**: the caller feeds raw bytes
 //! from TCP/TLS streams and collects outgoing frames. No async runtime needed.
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use ed25519_dalek::SigningKey;
 use rand_core::CryptoRngCore;
@@ -26,6 +27,9 @@ use crate::wire::{self, PacketType, PeerPort, WireReader};
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
+
+/// Link weight used for a peer with no latency measurement yet.
+pub const DEFAULT_LINK_LATENCY_MS: u64 = 10;
 
 /// Configuration for the leaf node.
 pub struct LiteConfig {
@@ -120,6 +124,10 @@ pub struct YggdrasilLite {
     /// Flushed when the matching PathNotify arrives; bounded.
     pending_traffic: Vec<(PublicKey, Vec<u8>)>,
 
+    /// Measured round-trip time per peer key, in ms. Used as the link weight in
+    /// tree parent selection; peers without a measurement use the default.
+    link_latency: BTreeMap<PublicKey, u64>,
+
     // Timers (tick-based, ms)
     last_tree_tick: u64,
     last_tree_refresh_tick: u64,
@@ -147,6 +155,7 @@ impl YggdrasilLite {
             sessions: SessionManager::new(),
             peers: PeerManager::new(),
             pending_traffic: Vec::new(),
+            link_latency: BTreeMap::new(),
             crypto,
             curve_priv,
             password: config.password,
@@ -220,6 +229,7 @@ impl YggdrasilLite {
             self.tree.remove_peer(&key);
             self.blooms.remove_peer(&key);
             self.peers.remove_peer(peer_id);
+            self.link_latency.remove(&key);
             // Force tree refresh since we may have lost our parent
             self.tree.set_needs_refresh();
             true
@@ -873,12 +883,23 @@ impl YggdrasilLite {
     // Internal helpers
     // -----------------------------------------------------------------------
 
+    /// Record the measured round-trip time to a peer, in ms. The tree uses it as
+    /// the link weight when choosing a parent.
+    pub fn set_link_latency(&mut self, key: PublicKey, rtt_ms: u64) {
+        self.link_latency.insert(key, rtt_ms);
+    }
+
+    /// Link weight for `key`: the measured RTT, or [`DEFAULT_LINK_LATENCY_MS`].
+    pub fn link_latency_ms(&self, key: &PublicKey) -> u64 {
+        self.link_latency.get(key).copied().unwrap_or(DEFAULT_LINK_LATENCY_MS)
+    }
+
     /// Collect peer info tuples for tree maintenance.
     fn collect_peer_info(&self) -> Vec<(PeerId, PublicKey, u64)> {
         self.peers
             .iter()
             .filter(|p| p.handshake_done)
-            .map(|p| (p.id, p.key, 10u64)) // TODO: actual latency measurement
+            .map(|p| (p.id, p.key, self.link_latency_ms(&p.key)))
             .collect()
     }
 
@@ -1278,5 +1299,21 @@ mod tests {
             !send_events.is_empty(),
             "send should produce outgoing events"
         );
+    }
+}
+
+#[cfg(test)]
+mod link_latency_tests {
+    use super::*;
+
+    #[test]
+    fn link_latency_defaults_then_follows_measurements() {
+        let mut node = YggdrasilLite::new(LiteConfig::new([7u8; 32]));
+        let key = [9u8; 32];
+        assert_eq!(node.link_latency_ms(&key), DEFAULT_LINK_LATENCY_MS);
+        node.set_link_latency(key, 42);
+        assert_eq!(node.link_latency_ms(&key), 42);
+        node.set_link_latency(key, 7);
+        assert_eq!(node.link_latency_ms(&key), 7);
     }
 }
