@@ -29,20 +29,21 @@
 //! default 3). The node dials the best candidates from `--peers` and replaces
 //! any that fail; see `src/pool.rs` for the selection rules.
 //!
-//! The device answers ICMPv6 echo requests from allowed keys automatically and
-//! serves a small HTML page on TCP port 80 (`--html FILE` replaces the default).
-//! Open it from a yggstack/yggdrasil node that is allowed: its SOCKS5 proxy at
-//! 127.0.0.1:1080 with `curl -x socks5h://127.0.0.1:1080 http://[<device-address>]/`.
+//! The device answers ICMPv6 echo requests from allowed keys automatically.
 //! `--ping` sends one echo request per second to an address and prints replies
 //! with round-trip times.
 //!
-//! The overlay page on port 80 shows the same stats, refreshed every second
-//! (unless `--html FILE` replaces it).
+//! Optional parts are build features (see README, "Build variants"):
 //!
-//! `--api ADDR` starts a status server (for example `--api 127.0.0.1:8080`):
-//! `GET /` serves a dashboard, `GET /api/stats` returns the same JSON as the
-//! ESP32 firmware. Bind to 127.0.0.1 unless you want the API on your network:
-//! it has no authentication.
+//! * `html`: an HTML server on port 1080 (`--html-port`). The overlay TCP port serves a status
+//!   page refreshed every second to allowed keys (`--html FILE` replaces it); open it from a
+//!   yggstack/yggdrasil node with `curl -x socks5h://127.0.0.1:1080 http://[<device>]:1080/`.
+//!   `127.0.0.1:1080` serves a dashboard (`GET /`) and the ESP32-compatible JSON
+//!   (`GET /api/stats`); `--api ADDR` moves it (loopback only, no authentication), `--api off`
+//!   disables it.
+//! * `upstream-tls`: `tls://` peers and `--lan-upstream` discovery of yggdrasil-go peers.
+//!
+//! Without them the node only forwards TCP and UDP over TCP peers.
 //!
 //! The key file is created on first run (64 hex chars). Keep it private: it
 //! determines the device's address.
@@ -53,22 +54,34 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV6, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 extern crate alloc;
 
-// The status API model is shared with the ESP32 firmware (pure Rust, no hardware deps).
+// The status API model is shared with the ESP32 firmware (pure Rust, no hardware deps). Only the
+// `html` build uses it.
+#[cfg(feature = "html")]
 #[path = "../../examples/esp32/src/api_model.rs"]
 #[allow(dead_code)]
 mod api_model;
-use api_model::{to_json, NetState, PeerState, PeerStat, DASHBOARD_HTML, MAX_PEERS};
+
+// Optional parts, each behind a feature and compiled to a stub without it:
+//   html       local status dashboard + JSON API and the overlay status page (src/bin/tcp_node/html.rs)
+//   upstream-tls  tls:// peers and yggdrasil-go LAN discovery (src/bin/tcp_node/discovery.rs)
+#[path = "tcp_node/discovery.rs"]
+mod discovery;
+#[path = "tcp_node/html.rs"]
+mod html;
 
 /// Protocol clock starts here (matches the library tests).
 const CLOCK_BASE: u64 = 1_000;
 
 /// Upper bound for `--target`: each outbound slot is a TCP connection and a TLS session.
 const MAX_TARGET: usize = 32;
+
+/// Default port of the HTML server: overlay port of the status page and local dashboard port.
+const HTML_PORT: u16 = 1080;
 
 /// Echo `id` used for quality probes (peer latency and root checks).
 const QUALITY_ID: u16 = 0x5155;
@@ -129,7 +142,7 @@ const FIRST_PROBE_MAX_WAIT: Duration = Duration::from_secs(60);
 
 /// TCP connect time to the candidate's address over the regular internet, or `None` on failure.
 fn probe_tcp(uri: &TcpPeerUri) -> Option<u64> {
-    let addr = match uri.expected_key().and_then(|k| lan_scoped_addr(&k)) {
+    let addr = match uri.expected_key().and_then(|k| discovery::lan_scoped_addr(&k)) {
         Some(sa) => SocketAddr::V6(sa),
         None => uri.host_port().to_socket_addrs().ok()?.next()?,
     };
@@ -190,8 +203,15 @@ struct Args {
     target: usize,
     send: Option<(Ipv6Addr, String)>,
     ping: Option<Ipv6Addr>,
+    /// `--html FILE`: page served on the overlay HTML port (html build).
+    #[cfg_attr(not(feature = "html"), allow(dead_code))]
     html: Option<String>,
+    /// `--api ADDR|off`: local dashboard address (html build).
+    #[cfg_attr(not(feature = "html"), allow(dead_code))]
     api: Option<String>,
+    /// `--html-port PORT`: overlay port of the page and default port of the local dashboard.
+    #[cfg_attr(not(feature = "html"), allow(dead_code))]
+    html_port: u16,
     quality_ms: u64,
     /// (overlay port, local port) pairs from `--forward`.
     forwards: Vec<(u16, u16)>,
@@ -211,14 +231,6 @@ struct Args {
     connects: Vec<(u16, Ipv6Addr, u16)>,
 }
 
-const DEFAULT_PAGE: &str = "<!doctype html>
-<html><head><meta charset=\"utf-8\"><title>yggdrasil-lite</title></head>
-<body style=\"font-family:sans-serif\">
-<h1>yggdrasil-lite device</h1>
-<p>Этот узел работает через Yggdrasil.</p>
-</body></html>
-";
-
 const USAGE: &str = "usage: tcp_node [options]
 
 With no options the node creates or loads its key (./ygg.key, else ~/ygg.key),
@@ -233,15 +245,18 @@ downloads the public peer list and connects.
   --connect LPORT:[ADDR]:PORT
                             carry 127.0.0.1:LPORT to [ADDR]:PORT over Yggdrasil
   --forward-udp PORT[:LOCAL],..  expose local UDP ports
-  --api ADDR                status dashboard and /api/stats (loopback only)
-  --html FILE               page served on overlay port 80
+  --api ADDR|off            status dashboard and /api/stats, loopback only
+                            (html build; default 127.0.0.1:<html-port>)
+  --html FILE               page served on the overlay HTML port (html build)
+  --html-port PORT          overlay port of the page and local dashboard port
+                            (html build, default 1080)
   --ping IPV6               echo request every second
   --send IPV6 MESSAGE       datagram every 10 s (test aid)
   --send-udp IPV6 PORT MSG  UDP datagram every 5 s (test aid)
   --quality-interval SECS   network re-check interval (default 300)
   --listen PORT             accept plain TCP peers on this port
-  --lan-upstream            dial yggdrasil-go LAN peers (needs upstream-tls build)
-  --lan-target N            outbound slots for LAN peers";
+  --lan-upstream            dial yggdrasil-go LAN peers (upstream-tls build)
+  --lan-target N            outbound slots for LAN peers (upstream-tls build)";
 
 fn usage() -> ! {
     eprintln!("{USAGE}");
@@ -262,7 +277,7 @@ fn parse_connect(spec: &str) -> Result<(u16, Ipv6Addr, u16), String> {
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { key: None, connects: Vec::new(), peers: None, allow: Vec::new(), target: 3, send: None, ping: None, html: None, api: None, quality_ms: DEFAULT_RECHECK_MS, forwards: Vec::new(), forwards_udp: Vec::new(), send_udp: None, lan_upstream: false, no_public: false, listen: None, lan_target: None };
+    let mut a = Args { key: None, connects: Vec::new(), peers: None, allow: Vec::new(), target: 3, send: None, ping: None, html: None, api: None, html_port: HTML_PORT, quality_ms: DEFAULT_RECHECK_MS, forwards: Vec::new(), forwards_udp: Vec::new(), send_udp: None, lan_upstream: false, no_public: false, listen: None, lan_target: None };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         match flag.as_str() {
@@ -281,8 +296,17 @@ fn parse_args() -> Args {
             "--peers" => a.peers = Some(it.next().unwrap_or_else(|| usage())),
             "--allow" => a.allow.push(it.next().unwrap_or_else(|| usage())),
             "--target" => a.target = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
+            "--html" | "--api" | "--html-port" if !cfg!(feature = "html") => {
+                eprintln!("{flag} needs a build with `--features html`");
+                std::process::exit(2);
+            }
+            "--lan-upstream" | "--lan-target" if !cfg!(feature = "upstream-tls") => {
+                eprintln!("{flag} needs a build with `--features upstream-tls`");
+                std::process::exit(2);
+            }
             "--html" => a.html = Some(it.next().unwrap_or_else(|| usage())),
             "--api" => a.api = Some(it.next().unwrap_or_else(|| usage())),
+            "--html-port" => a.html_port = it.next().and_then(|v| v.parse().ok()).filter(|p| *p > 0).unwrap_or_else(|| usage()),
             "--forward" => {
                 let spec = it.next().unwrap_or_else(|| usage());
                 for part in spec.split(',') {
@@ -446,11 +470,9 @@ fn pump_bridge(ep: &mut Endpoint, id: ConnId, b: &mut Bridge, buf: &mut [u8]) ->
     true
 }
 
-/// `poll(2)` over a reusable descriptor set, and the shared beacon socket.
+/// `poll(2)` over a reusable descriptor set.
 mod sys {
     use super::RawFd;
-    use std::net::UdpSocket;
-    use std::os::unix::io::FromRawFd;
     use std::time::Duration;
 
     pub const IN: i16 = libc::POLLIN;
@@ -505,42 +527,6 @@ mod sys {
         }
     }
 
-    /// Bind `[::]:port` with SO_REUSEADDR and SO_REUSEPORT. std cannot set them before `bind`,
-    /// and a yggdrasil-go on the same host (which sets both on its multicast socket) already
-    /// holds the beacon port; a plain bind fails with "address already in use" and discovery
-    /// would be off exactly where it is most likely wanted.
-    pub fn bind_udp6_shared(port: u16) -> std::io::Result<UdpSocket> {
-        // SAFETY: plain socket calls; the descriptor is closed on every error path and otherwise
-        // handed to `UdpSocket`, which owns it from then on. `sockaddr_in6` is zeroed first, so
-        // platform-specific fields (such as `sin6_len`) are valid.
-        unsafe {
-            let fd = libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0);
-            if fd < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            let one: libc::c_int = 1;
-            let size = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-            let ptr = &one as *const libc::c_int as *const libc::c_void;
-            let mut ok = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, ptr, size) == 0;
-            // Not every platform has SO_REUSEPORT; SO_REUSEADDR alone shares a multicast port on Linux.
-            let _ = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT, ptr, size);
-            let mut addr: libc::sockaddr_in6 = std::mem::zeroed();
-            addr.sin6_family = libc::AF_INET6 as libc::sa_family_t;
-            addr.sin6_port = port.to_be();
-            ok = ok
-                && libc::bind(
-                    fd,
-                    &addr as *const libc::sockaddr_in6 as *const libc::sockaddr,
-                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-                ) == 0;
-            if !ok {
-                let e = std::io::Error::last_os_error();
-                libc::close(fd);
-                return Err(e);
-            }
-            Ok(UdpSocket::from_raw_fd(fd))
-        }
-    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -727,28 +713,11 @@ impl Stream {
     }
 }
 
-/// Upstream LAN peers found by beacon: key -> scoped link-local address (with the interface id).
-/// Shared between the probe threads and the dialer, which otherwise only see URIs without zone ids.
-static LAN_SCOPED: Mutex<Vec<(PublicKey, SocketAddrV6)>> = Mutex::new(Vec::new());
-
-fn lan_scoped_set(key: PublicKey, addr: SocketAddrV6) {
-    if let Ok(mut v) = LAN_SCOPED.lock() {
-        match v.iter_mut().find(|(k, _)| *k == key) {
-            Some(entry) => entry.1 = addr,
-            None => v.push((key, addr)),
-        }
-    }
-}
-
-fn lan_scoped_addr(key: &PublicKey) -> Option<SocketAddrV6> {
-    LAN_SCOPED.lock().ok()?.iter().find(|(k, _)| k == key).map(|(_, a)| *a)
-}
-
 /// Open a connection for a candidate. Upstream LAN peers go over TLS to their scoped address;
 /// everything else is a plain TCP connection as before.
 fn dial_slot(uri: &TcpPeerUri) -> Option<Stream> {
     if let Some(key) = uri.expected_key() {
-        if let Some(sa) = lan_scoped_addr(&key) {
+        if let Some(sa) = discovery::lan_scoped_addr(&key) {
             let s = dial_lan_tls(SocketAddr::V6(sa));
             if s.is_none() {
                 eprintln!("lan: dial {sa} failed");
@@ -1000,80 +969,6 @@ fn udp_inbound(
     }
 }
 
-/// yggdrasil-go LAN discovery: IPv6 link-local multicast group and port.
-const UPSTREAM_GROUP: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x0114);
-const UPSTREAM_BEACON_PORT: u16 = 9001;
-
-/// Parse a yggdrasil-go beacon (big endian): major u16 (0), minor u16 (5), public key (32),
-/// listen port u16, hash length u16, hash. The hash is BLAKE2b-512 of the key with no password.
-/// Anything else (other version, bad hash, wrong length) is ignored.
-fn parse_upstream_beacon(b: &[u8]) -> Option<(PublicKey, u16)> {
-    if b.len() < 40 {
-        return None;
-    }
-    let major = u16::from_be_bytes([b[0], b[1]]);
-    let minor = u16::from_be_bytes([b[2], b[3]]);
-    if major != 0 || minor != 5 {
-        return None;
-    }
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&b[4..36]);
-    let port = u16::from_be_bytes([b[36], b[37]]);
-    let hash_len = u16::from_be_bytes([b[38], b[39]]) as usize;
-    if port == 0 || hash_len != 64 || b.len() != 40 + hash_len {
-        return None;
-    }
-    use blake2::{Blake2b512, Digest};
-    let mut hasher = Blake2b512::new();
-    hasher.update(key);
-    let expected = hasher.finalize();
-    if &b[40..] != expected.as_slice() {
-        return None;
-    }
-    Some((key, port))
-}
-
-/// Interface indices to join the beacon group on. Android (Termux) denies apps read access to
-/// `/sys/class/net`, so sysfs is only a first try; otherwise probe small indices, since joining
-/// a non-existent index fails and a real one succeeds.
-fn lan_ifindices() -> Vec<u32> {
-    let mut out = Vec::new();
-    if let Ok(rd) = std::fs::read_dir("/sys/class/net") {
-        for entry in rd.flatten() {
-            if entry.file_name().to_str() == Some("lo") {
-                continue;
-            }
-            if let Ok(t) = std::fs::read_to_string(entry.path().join("ifindex")) {
-                if let Ok(idx) = t.trim().parse::<u32>() {
-                    out.push(idx);
-                }
-            }
-        }
-    }
-    if out.is_empty() {
-        out = (1..=64).collect();
-    }
-    out
-}
-
-/// Listen for yggdrasil-go beacons on every interface we can join the group on.
-fn upstream_lan_socket() -> Result<UdpSocket, Box<dyn Error>> {
-    let sock = sys::bind_udp6_shared(UPSTREAM_BEACON_PORT)
-        .map_err(|e| format!("bind [::]:{UPSTREAM_BEACON_PORT}: {e}"))?;
-    let mut joined = Vec::new();
-    for idx in lan_ifindices() {
-        if sock.join_multicast_v6(&UPSTREAM_GROUP, idx).is_ok() {
-            joined.push(idx);
-        }
-    }
-    if joined.is_empty() {
-        return Err(format!("could not join {UPSTREAM_GROUP} on any interface (tried sysfs and indices 1-64)").into());
-    }
-    println!("lan upstream:   joined {UPSTREAM_GROUP} on ifindex {joined:?}");
-    sock.set_nonblocking(true)?;
-    Ok(sock)
-}
-
 /// First 4 bytes of a key, as hex, for logs.
 fn short_key(k: &PublicKey) -> String {
     k.iter().take(4).map(|b| format!("{:02x}", b)).collect()
@@ -1120,10 +1015,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             std::process::exit(2);
         }
     }
-    if args.lan_upstream && !cfg!(feature = "upstream-tls") {
-        eprintln!("--lan-upstream needs a build with `--features upstream-tls`");
-        std::process::exit(2);
-    }
     let lan_slots = if args.lan_upstream { args.lan_target.unwrap_or(args.target) } else { 0 };
     let mut ep = Endpoint::new_with_lan(seed, None, args.target, lan_slots);
     // tls:// peers only when this build can dial them.
@@ -1156,25 +1047,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     for k in &allow_keys {
         ep.allow_key(*k);
     }
-    let page = match &args.html {
-        Some(path) => std::fs::read(path)?,
-        None => DEFAULT_PAGE.as_bytes().to_vec(),
-    };
-    ep.serve_http(page);
-
-    let shared: Arc<Mutex<NetState>> = Arc::new(Mutex::new(NetState::new()));
-    if let Some(addr) = &args.api {
-        let sock: std::net::SocketAddr = addr
-            .parse()
-            .map_err(|e| format!("--api: invalid address {addr}: {e}"))?;
-        if !sock.ip().is_loopback() {
-            return Err(format!("--api must bind to loopback (127.0.0.1 or [::1]), got {addr}").into());
-        }
-        let listener = TcpListener::bind(sock)?;
-        println!("status API:     http://{addr}/  (JSON: /api/stats)");
-        let shared = shared.clone();
-        std::thread::spawn(move || serve_api(listener, shared));
-    }
+    // Status pages (html build only): overlay page and local dashboard/API.
+    let html = html::Html::start(&args, &mut ep)?;
 
     let forward_map: HashMap<u16, u16> = args.forwards.iter().copied().collect();
     for (overlay, local) in &args.forwards {
@@ -1188,9 +1062,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         l.set_nonblocking(true)?;
         println!("connect:        127.0.0.1:{lport} -> [{addr}]:{port}");
         connect_listeners.push((l, *addr, *port));
-    }
-    if forward_map.contains_key(&80) {
-        println!("note: overlay port 80 is forwarded, so the overlay status page is not served");
     }
 
     let addr = Address(ep.address().0);
@@ -1243,20 +1114,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     for (overlay, local) in &args.forwards_udp {
         println!("forward udp:    overlay port {overlay} -> 127.0.0.1:{local}");
     }
-    let upstream_sock = if args.lan_upstream {
-        match upstream_lan_socket() {
-            Ok(s) => {
-                println!("lan upstream:   [{}]:{} (listen only, TLS dial)", UPSTREAM_GROUP, UPSTREAM_BEACON_PORT);
-                Some(s)
-            }
-            Err(e) => {
-                eprintln!("lan upstream: disabled: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let upstream_sock = discovery::open(args.lan_upstream);
     let listener = match args.listen {
         Some(port) => match TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)) {
             Ok(l) => {
@@ -1328,27 +1186,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
-        // yggdrasil-go LAN beacons: listen only, never send. Each beacon's source is a link-local
-        // address whose scope id is the interface; keep it so we can dial that exact address.
+        // yggdrasil-go LAN beacons (upstream-tls build): listen only, never send.
         if let Some(sock) = upstream_sock.as_ref() {
-            let mut buf = [0u8; 128];
-            while let Ok((n, src)) = sock.recv_from(&mut buf) {
-                let Some((key, port)) = parse_upstream_beacon(&buf[..n]) else { continue };
-                if key == *ep.public_key() {
-                    continue;
-                }
-                let SocketAddr::V6(v6) = src else { continue };
-                if v6.ip().segments()[0] & 0xffc0 != 0xfe80 || v6.scope_id() == 0 {
-                    continue;
-                }
-                lan_scoped_set(key, SocketAddrV6::new(*v6.ip(), port, 0, v6.scope_id()));
-                let uri = format!("tcp://[{}]:{}?key={}", v6.ip(), port, hex(&key));
-                match ep.add_peer_uri(&uri, CandidateSource::Discovered) {
-                    Ok(true) => println!("lan: discovered upstream {} (scope {})", uri, v6.scope_id()),
-                    Ok(false) => {}
-                    Err(e) => println!("lan: bad upstream beacon from {src}: {e:?}"),
-                }
-            }
+            discovery::drain(sock, &mut ep);
         }
 
         // Inbound TCP peers (only when --listen is set).
@@ -1552,14 +1392,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         if last_snap.elapsed() >= Duration::from_secs(1) {
             last_snap = Instant::now();
-            let snap = snapshot(&ep, clock(start));
-            // Overlay page (port 80 over Yggdrasil): the live stats, unless the user gave --html.
-            if args.html.is_none() {
-                ep.serve_http(status_page(&ep, &quality, &overlay, args.target + lan_slots, clock(start)).into_bytes());
-            }
-            if args.api.is_some() {
-                *shared.lock().unwrap() = snap;
-            }
+            html.refresh(&mut ep, &quality, &overlay, args.target + lan_slots, clock(start));
         }
 
         // TCP over the overlay: --forward (remote clients in) and --connect (local clients out).
@@ -1840,8 +1673,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 
-/// Analysis state shown on the overlay status page.
+/// Analysis state shown on the overlay status page (read only by the html build).
 #[derive(Default)]
+#[cfg_attr(not(feature = "html"), allow(dead_code))]
 struct OverlayInfo {
     verdict: Option<Verdict>,
     /// Protocol time of the last evaluation.
@@ -1858,11 +1692,6 @@ struct OverlayInfo {
     searching: bool,
 }
 
-fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
-}
-
-/// Slowest connected outbound peer by measured latency (falls back to the pool estimate).
 /// "клиент 220 ms" / "корень 350 ms": the latency that decided a peer replacement.
 fn metric_text(m: Metric) -> String {
     match m {
@@ -1876,286 +1705,6 @@ fn push_swap(overlay: &mut OverlayInfo, msg: String) {
     overlay.swaps.push(msg);
     if overlay.swaps.len() > 5 {
         overlay.swaps.remove(0);
-    }
-}
-
-/// Live update for the overlay status page: re-fetch the page every 2 s and swap the body in place.
-/// The overlay server answers any request with the current page, so no extra endpoint is needed.
-const STATUS_SCRIPT: &str = r#"<script>
-(function () {
-  var busy = false;
-  function setUpd(text) {
-    var el = document.getElementById('upd');
-    if (el) { el.textContent = text; }
-  }
-  function tick() {
-    if (busy) { return; }
-    busy = true;
-    fetch(location.href, { cache: 'no-store' })
-      .then(function (r) { return r.text(); })
-      .then(function (t) {
-        var doc = new DOMParser().parseFromString(t, 'text/html');
-        document.body.innerHTML = doc.body.innerHTML;
-        renderSpeed();
-        setUpd('обновлено ' + new Date().toLocaleTimeString());
-      })
-      .catch(function () { setUpd('нет связи, повтор...'); })
-      .then(function () { busy = false; });
-  }
-  var speedText = 'не запускался';
-  var speedBusy = false;
-  function renderSpeed() {
-    var el = document.getElementById('speed');
-    if (el) { el.textContent = speedText; }
-  }
-  window.runSpeed = function () {
-    if (speedBusy) { return; }
-    speedBusy = true;
-    speedText = 'измерение...';
-    renderSpeed();
-    var ctrl = new AbortController();
-    var timer = setTimeout(function () { ctrl.abort(); }, 20000);
-    var t0 = performance.now();
-    fetch('/speed?' + Date.now(), { cache: 'no-store', signal: ctrl.signal })
-      .then(function (r) { return r.arrayBuffer(); })
-      .then(function (buf) {
-        var sec = (performance.now() - t0) / 1000;
-        var mbit = buf.byteLength * 8 / sec / 1e6;
-        speedText = mbit.toFixed(2) + ' Мбит/с (' + buf.byteLength + ' байт за ' + sec.toFixed(1) + ' с)';
-      })
-      .catch(function () { speedText = 'не удалось: таймаут или обрыв канала'; })
-      .then(function () { clearTimeout(timer); speedBusy = false; renderSpeed(); });
-  };
-  setInterval(tick, 2000);
-})();
-</script>"#;
-
-/// HTML status page for the overlay port 80: every `--target` slot, root summary, replacement log.
-fn status_page(ep: &Endpoint, quality: &Quality, info: &OverlayInfo, target: usize, now: u64) -> String {
-    let outbound: Vec<_> = ep
-        .connected_peers()
-        .into_iter()
-        .filter(|p| p.direction == Direction::Outbound)
-        .collect();
-
-    let root_line = match quality.root_rtt() {
-        Some(r) if r > ROOT_RTT_LIMIT_MS => format!("<span class=\"bad\">{r} ms (больше {ROOT_RTT_LIMIT_MS} ms)</span>"),
-        Some(r) => format!("<span class=\"ok\">{r} ms</span>"),
-        None => "нет измерения".into(),
-    };
-    let (root_text, global_n, foreign_n, unknown_n, eval_text) = match &info.verdict {
-        Some(v) => (
-            v.global_root.map(|r| short_key(&r)).unwrap_or_else(|| "нет".into()),
-            v.global.len(),
-            v.foreign.len(),
-            v.unknown.len(),
-            info.eval_at
-                .map(|t| format!("{} с назад", now.saturating_sub(t) / 1000))
-                .unwrap_or_default(),
-        ),
-        None => ("ещё не оценено".into(), 0, 0, 0, String::new()),
-    };
-
-    let mut rows = String::new();
-    for p in &outbound {
-        let uri = p.uri.as_ref().map(|u| u.to_string()).unwrap_or_else(|| "?".into());
-        let rtt = quality
-            .rtt(&p.key)
-            .or(p.rtt_ms)
-            .map(|r| format!("{r} ms"))
-            .unwrap_or_else(|| "?".into());
-        let net = match info.verdict.as_ref() {
-            Some(v) if v.global.contains(&p.key) => "главный корень",
-            Some(v) if v.foreign.contains(&p.key) => "чужой корень",
-            Some(_) => "ожидание",
-            None => "—",
-        };
-        let up = now.saturating_sub(p.up_ms) / 1000;
-        rows.push_str(&format!(
-            "<tr><td>{}</td><td><code>{}…</code></td><td>{}</td><td>{}</td><td>{} с</td><td class=\"ok\">подключён</td></tr>\n",
-            esc(&uri),
-            short_key(&p.key),
-            rtt,
-            net,
-            up
-        ));
-    }
-    for _ in outbound.len()..target {
-        rows.push_str("<tr><td colspan=\"6\" class=\"dim\">слот свободен: подбирается кандидат</td></tr>\n");
-    }
-
-    let mut allow_rows = String::new();
-    for k in &info.allow_keys {
-        let addr = Ipv6Addr::from(addr_for_key(k).0);
-        let (rtt_cell, status) = match info.allow_rtt.get(k) {
-            Some((r, at)) => {
-                let age = now.saturating_sub(*at) / 1000;
-                let cls = if *r > CLIENT_RTT_LIMIT_MS { "bad" } else { "ok" };
-                let st = if *r > CLIENT_RTT_LIMIT_MS { "высокий" } else { "в норме" };
-                (format!("<span class=\"{cls}\">{r} ms</span> ({age} с назад)"), st)
-            }
-            None => ("нет ответа".into(), "клиент не отвечает на echo"),
-        };
-        allow_rows.push_str(&format!(
-            "<tr><td><code>{}…</code></td><td><code>{addr}</code></td><td>{rtt_cell}</td><td>{status}</td></tr>\n",
-            short_key(k)
-        ));
-    }
-    if allow_rows.is_empty() {
-        allow_rows.push_str("<tr><td colspan=\"4\" class=\"dim\">разрешённых клиентов нет (--allow)</td></tr>\n");
-    }
-
-    let swaps: String = if info.swaps.is_empty() {
-        "<p class=\"dim\">замен не было</p>".into()
-    } else {
-        let items: String = info.swaps.iter().rev().map(|s| format!("<li>{}</li>", esc(s))).collect();
-        format!("<ul>{items}</ul>")
-    };
-
-    format!(
-        "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">\
-<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-{script}<title>yggdrasil-lite</title>\
-<style>body{{font-family:sans-serif;margin:1.5em;color:#222}}table{{border-collapse:collapse;width:100%;font-size:14px}}\
-td,th{{border:1px solid #ccc;padding:4px 6px;text-align:left}}.ok{{color:#080}}.bad{{color:#c00;font-weight:bold}}\
-.dim{{color:#888}}code{{font-size:12px}}</style></head><body>\
-<h1>yggdrasil-lite</h1>\
-<p>адрес: <code>{addr}</code><br>ключ: <code>{pk}…</code></p>\
-<p class=\"dim\" id=\"upd\">загрузка данных…</p>\
-<h2>Сводка до корня</h2>\
-<table>\
-<tr><th>корень сети</th><td><code>{root_text}</code></td></tr>\
-<tr><th>пинг до корня</th><td>{root_line}</td></tr>\
-<tr><th>пиры на главном корне</th><td>{global_n}</td></tr>\
-<tr><th>на чужом корне</th><td>{foreign_n}</td></tr>\
-<tr><th>не определены</th><td>{unknown_n}</td></tr>\
-<tr><th>порог замены</th><td>клиент {CLIENT_RTT_LIMIT_MS} ms (приоритет), корень {ROOT_RTT_LIMIT_MS} ms (если клиенты не отвечают)</td></tr>\
-<tr><th>последняя оценка</th><td>{eval_text}</td></tr>\
-</table>\
-<h2>Пиры (--target {target})</h2>\
-<table><tr><th>адрес</th><th>ключ</th><th>RTT</th><th>сеть</th><th>аптайм</th><th>статус</th></tr>\n{rows}</table>\
-<h2>Разрешённые клиенты (адрес до клиента)</h2>\
-<table><tr><th>ключ</th><th>адрес</th><th>RTT</th><th>статус</th></tr>\n{allow_rows}</table>\
-<h2>Тест скорости (канал до узла)</h2>\
-<p><button onclick=\"runSpeed()\">Тест скорости (256 КБ)</button> <span id=\"speed\">не запускался</span></p>\
-<h2>Замены пиров</h2>{swaps}\
-</body></html>",
-        addr = Ipv6Addr::from(ep.address().0),
-        pk = short_key(ep.public_key()),
-        script = STATUS_SCRIPT,
-    )
-}
-
-/// Build the status snapshot from the endpoint: node counters plus up to
-/// `MAX_PEERS` peer slots (connected outbound peers first, then candidates).
-fn snapshot(ep: &Endpoint, now: u64) -> NetState {
-    let mut st = NetState::new();
-    st.node.device = false;
-    st.node.uptime_ms = now.saturating_sub(CLOCK_BASE);
-    st.node.ipv6 = ep.address().0;
-    st.node.listen_port = 80; // overlay HTTP page
-    st.node.public_key = *ep.public_key();
-    st.node.root = ep.root();
-    st.node.coords = ep.coords();
-    st.node.sessions = ep.session_count();
-    st.node.paths = ep.path_count();
-
-    let mut slot = 0;
-    let mut shown: Vec<String> = Vec::new();
-    for p in ep.connected_peers().into_iter().filter(|p| p.direction == Direction::Outbound) {
-        if slot >= MAX_PEERS {
-            break;
-        }
-        // host:port only: the key is shown in its own field and can exceed the address buffer.
-        let uri = p.uri.map(|u| u.host_port()).unwrap_or_default();
-        let ps = &mut st.peers[slot];
-        let _ = ps.addr.push_str(&uri);
-        ps.key = Some(p.key);
-        ps.state = PeerState::Up;
-        ps.rtt_ms = p.rtt_ms.map(|r| r as u32);
-        ps.up_since_ms = Some(p.up_ms.saturating_sub(CLOCK_BASE));
-        shown.push(uri);
-        slot += 1;
-    }
-    for c in ep.candidates() {
-        if slot >= MAX_PEERS {
-            break;
-        }
-        let uri = c.uri.host_port();
-        if shown.contains(&uri) {
-            continue;
-        }
-        let ps: &mut PeerStat = &mut st.peers[slot];
-        let _ = ps.addr.push_str(&uri);
-        ps.state = if c.failures > 0 { PeerState::Failed } else { PeerState::Idle };
-        ps.rtt_ms = c.rtt_ms.map(|r| r as u32);
-        // Every failure was a failed attempt; the pool does not count attempts separately.
-        ps.attempts = c.failures;
-        ps.failures = c.failures;
-        slot += 1;
-    }
-    st
-}
-
-/// Accept connections and answer each on its own thread.
-fn serve_api(listener: TcpListener, shared: Arc<Mutex<NetState>>) {
-    for conn in listener.incoming().flatten() {
-        let shared = shared.clone();
-        std::thread::spawn(move || handle_api_conn(conn, &shared));
-    }
-}
-
-fn handle_api_conn(mut conn: TcpStream, shared: &Mutex<NetState>) {
-    let _ = conn.set_read_timeout(Some(Duration::from_secs(5)));
-    let mut buf = [0u8; 1024];
-    let n = conn.read(&mut buf).unwrap_or(0);
-    let head = String::from_utf8_lossy(&buf[..n]);
-    let mut parts = head.lines().next().unwrap_or("").split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let path = parts.next().unwrap_or("/");
-
-    let (status, ctype, body): (&str, &str, String) = match (method, path) {
-        ("GET", "/") => ("200 OK", "text/html; charset=utf-8", DASHBOARD_HTML.to_string()),
-        ("GET", "/api/stats") => {
-            let st = shared.lock().unwrap();
-            ("200 OK", "application/json", to_json(&st))
-        }
-        ("GET", _) => ("404 Not Found", "text/plain; charset=utf-8", "not found\n".to_string()),
-        _ => ("405 Method Not Allowed", "text/plain; charset=utf-8", "method not allowed\n".to_string()),
-    };
-    let resp = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let _ = conn.write_all(resp.as_bytes());
-}
-
-#[cfg(test)]
-mod status_page_tests {
-    use super::*;
-
-    #[test]
-    fn renders_all_target_slots_and_root_summary() {
-        let ep = Endpoint::new([7u8; 32], None, 3);
-        let q = Quality::new(DEFAULT_RECHECK_MS);
-        let mut info = OverlayInfo::default();
-        info.swaps.push("корень 200 ms > 150 ms: заменён пир 0a0b0c0d".into());
-        let html = status_page(&ep, &q, &info, 3, 5_000);
-        assert_eq!(html.matches("слот свободен").count(), 3);
-        assert!(html.contains("Сводка до корня"));
-        assert!(html.contains("setInterval"));
-        assert!(!html.contains("http-equiv"));
-        assert!(html.contains("id=\"upd\""));
-        assert!(html.contains("замены"), "{html}");
-        assert!(html.contains("разрешённых клиентов нет"));
-
-        let mut info2 = OverlayInfo::default();
-        let client = [9u8; 32];
-        info2.allow_keys.push(client);
-        info2.allow_rtt.insert(client, (220, 4_000));
-        let html2 = status_page(&ep, &q, &info2, 3, 5_000);
-        assert!(html2.contains("220 ms"));
-        assert!(html2.contains("высокий"));
     }
 }
 
@@ -2176,45 +1725,5 @@ mod probe_nonce_tests {
         // The matching echo completes it once.
         assert_eq!(take_probe(&mut map, &key, &[1, 2, 3, 4, 5, 6, 7, 8]), Some(1_000));
         assert_eq!(take_probe(&mut map, &key, &[1, 2, 3, 4, 5, 6, 7, 8]), None);
-    }
-}
-
-#[cfg(test)]
-mod upstream_beacon_tests {
-    use super::*;
-    use blake2::{Blake2b512, Digest};
-
-    fn beacon(key: &PublicKey, port: u16) -> Vec<u8> {
-        let mut b = Vec::new();
-        b.extend_from_slice(&0u16.to_be_bytes());
-        b.extend_from_slice(&5u16.to_be_bytes());
-        b.extend_from_slice(key);
-        b.extend_from_slice(&port.to_be_bytes());
-        let mut h = Blake2b512::new();
-        h.update(key);
-        let hash = h.finalize();
-        b.extend_from_slice(&64u16.to_be_bytes());
-        b.extend_from_slice(hash.as_slice());
-        b
-    }
-
-    #[test]
-    fn upstream_beacon_round_trip() {
-        let key = [7u8; 32];
-        assert_eq!(parse_upstream_beacon(&beacon(&key, 9001)), Some((key, 9001)));
-    }
-
-    #[test]
-    fn upstream_beacon_rejects_bad_input() {
-        let key = [7u8; 32];
-        let mut wrong_version = beacon(&key, 9001);
-        wrong_version[3] = 4;
-        assert_eq!(parse_upstream_beacon(&wrong_version), None);
-        let mut bad_hash = beacon(&key, 9001);
-        let last = bad_hash.len() - 1;
-        bad_hash[last] ^= 1;
-        assert_eq!(parse_upstream_beacon(&bad_hash), None);
-        assert_eq!(parse_upstream_beacon(&beacon(&key, 9001)[..50]), None);
-        assert_eq!(parse_upstream_beacon(&beacon(&key, 0)), None);
     }
 }

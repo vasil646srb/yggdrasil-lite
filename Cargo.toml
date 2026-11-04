@@ -35,6 +35,9 @@ std = []
 # Dial yggdrasil-go LAN peers and tls:// peers over TLS (tcp_node --lan-upstream) via rustls. Off by
 # default so the no_std library build never pulls it in.
 upstream-tls = ["dep:rustls"]
+# tcp_node: the HTML server on port 1080: local status dashboard + JSON API (127.0.0.1:1080) and the
+# status page on overlay port 1080. Off by default: the plain build is only TCP/UDP forwarding.
+html = []
 smoltcp = ["dep:smoltcp"]
 # Act as a transit node: merge peer bloom filters into advertisements,
 # forward PathLookup/PathNotify/PathBroken, and forward traffic between peers.
