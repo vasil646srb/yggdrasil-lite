@@ -674,6 +674,7 @@ dependencies = [
  "ed25519-dalek",
  "heapless",
  "hex",
+ "libc",
  "rand",
  "rand_core",
  "rustls",

@@ -40,6 +40,11 @@ smoltcp = ["dep:smoltcp"]
 # forward PathLookup/PathNotify/PathBroken, and forward traffic between peers.
 transit = []
 
+# tcp_node only (Unix): poll(2) for the main loop and a UDP socket that shares the beacon port
+# with a local yggdrasil-go. Already in the tree through rand, so it adds nothing to the build.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 hex = "0.4"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

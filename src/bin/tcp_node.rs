@@ -446,31 +446,20 @@ fn pump_bridge(ep: &mut Endpoint, id: ConnId, b: &mut Bridge, buf: &mut [u8]) ->
     true
 }
 
-/// Minimal `poll(2)` binding. std has no readiness API and libc is already linked by std,
-/// so declaring the one function avoids a new dependency (the binary keeps `rand` + `heapless`).
+/// `poll(2)` over a reusable descriptor set, and the shared beacon socket.
 mod sys {
     use super::RawFd;
-    use std::os::raw::{c_int, c_ulong};
+    use std::net::UdpSocket;
+    use std::os::unix::io::FromRawFd;
     use std::time::Duration;
 
-    pub const IN: i16 = 0x001;
-    pub const OUT: i16 = 0x004;
-
-    #[repr(C)]
-    struct PollFd {
-        fd: c_int,
-        events: i16,
-        revents: i16,
-    }
-
-    extern "C" {
-        fn poll(fds: *mut PollFd, nfds: c_ulong, timeout: c_int) -> c_int;
-    }
+    pub const IN: i16 = libc::POLLIN;
+    pub const OUT: i16 = libc::POLLOUT;
 
     /// A reusable set of descriptors to wait on.
     #[derive(Default)]
     pub struct Poller {
-        fds: Vec<PollFd>,
+        fds: Vec<libc::pollfd>,
     }
 
     impl Poller {
@@ -483,7 +472,7 @@ mod sys {
         /// right now cannot wake the loop.
         pub fn add(&mut self, fd: RawFd, events: i16) -> usize {
             let fd = if events == 0 { -1 } else { fd };
-            self.fds.push(PollFd { fd, events, revents: 0 });
+            self.fds.push(libc::pollfd { fd, events, revents: 0 });
             self.fds.len() - 1
         }
 
@@ -492,10 +481,9 @@ mod sys {
             for f in &mut self.fds {
                 f.revents = 0;
             }
-            let timeout = timeout_ms.min(c_int::MAX as u64) as c_int;
-            // SAFETY: `fds` points at `len` initialized `PollFd` (repr(C), the layout of
-            // `struct pollfd`) and stays borrowed for the whole call.
-            let r = unsafe { poll(self.fds.as_mut_ptr(), self.fds.len() as c_ulong, timeout) };
+            let timeout = timeout_ms.min(libc::c_int::MAX as u64) as libc::c_int;
+            // SAFETY: `fds` points at `len` initialized `pollfd` and stays borrowed for the call.
+            let r = unsafe { libc::poll(self.fds.as_mut_ptr(), self.fds.len() as libc::nfds_t, timeout) };
             if r < 0 {
                 for f in &mut self.fds {
                     f.revents = 0;
@@ -514,6 +502,43 @@ mod sys {
 
         pub fn any_ready(&self) -> bool {
             self.fds.iter().any(|f| f.revents != 0)
+        }
+    }
+
+    /// Bind `[::]:port` with SO_REUSEADDR and SO_REUSEPORT. std cannot set them before `bind`,
+    /// and a yggdrasil-go on the same host (which sets both on its multicast socket) already
+    /// holds the beacon port; a plain bind fails with "address already in use" and discovery
+    /// would be off exactly where it is most likely wanted.
+    pub fn bind_udp6_shared(port: u16) -> std::io::Result<UdpSocket> {
+        // SAFETY: plain socket calls; the descriptor is closed on every error path and otherwise
+        // handed to `UdpSocket`, which owns it from then on. `sockaddr_in6` is zeroed first, so
+        // platform-specific fields (such as `sin6_len`) are valid.
+        unsafe {
+            let fd = libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0);
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let one: libc::c_int = 1;
+            let size = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            let ptr = &one as *const libc::c_int as *const libc::c_void;
+            let mut ok = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, ptr, size) == 0;
+            // Not every platform has SO_REUSEPORT; SO_REUSEADDR alone shares a multicast port on Linux.
+            let _ = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT, ptr, size);
+            let mut addr: libc::sockaddr_in6 = std::mem::zeroed();
+            addr.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            addr.sin6_port = port.to_be();
+            ok = ok
+                && libc::bind(
+                    fd,
+                    &addr as *const libc::sockaddr_in6 as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                ) == 0;
+            if !ok {
+                let e = std::io::Error::last_os_error();
+                libc::close(fd);
+                return Err(e);
+            }
+            Ok(UdpSocket::from_raw_fd(fd))
         }
     }
 }
@@ -1033,7 +1058,7 @@ fn lan_ifindices() -> Vec<u32> {
 
 /// Listen for yggdrasil-go beacons on every interface we can join the group on.
 fn upstream_lan_socket() -> Result<UdpSocket, Box<dyn Error>> {
-    let sock = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, UPSTREAM_BEACON_PORT))
+    let sock = sys::bind_udp6_shared(UPSTREAM_BEACON_PORT)
         .map_err(|e| format!("bind [::]:{UPSTREAM_BEACON_PORT}: {e}"))?;
     let mut joined = Vec::new();
     for idx in lan_ifindices() {
