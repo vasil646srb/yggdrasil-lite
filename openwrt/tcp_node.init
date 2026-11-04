@@ -17,8 +17,10 @@ PEERS=/root/peers.json
 # Outbound peers to keep connected (1..32).
 TARGET=2
 # Public keys (hex) allowed to reach this router, space-separated. Each key
-# can use the forwarded ports below. Replace the placeholder.
-ALLOW="REPLACE_WITH_CLIENT_PUBLIC_KEY"
+# can use the forwarded ports below, and the node measures its latency: the peer search
+# optimises the path to these keys first and to the tree root second. Add more keys
+# separated by spaces.
+ALLOW="9bf37423777fab63d13b6c125dd0cdb5f2c1d5fe850fa7316fd79fdb6de1ddc6"
 # Overlay ports to forward to the router's local ports: "22" or "2222:22,8080".
 # Only allowed keys can connect. Example: SSH on the router's port 22.
 FORWARD="22"
