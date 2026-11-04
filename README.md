@@ -67,7 +67,19 @@ cargo test --features upstream-tls --bin tcp_node upstream_beacon
 
 ### Running `tcp_node`
 
-Basic run with the public peer list (downloaded on start):
+Simplest run, no options:
+
+```sh
+./tcp_node
+```
+
+The node loads or creates its key (`./ygg.key` if present, otherwise `~/ygg.key`),
+downloads the public peer list in the background (curl, wget or OpenWrt's
+`uclient-fetch`), probes the candidates and connects. The list is cached as
+`peers-cache.json` next to the key and used at the next start right away; a failed
+download is retried every minute, a successful one is refreshed every 6 hours.
+
+With options:
 
 ```sh
 ./target/release/tcp_node --key ~/ygg.key --target 3 --api 127.0.0.1:8080
@@ -86,12 +98,13 @@ address, so keep it private.
 
 | Option | Meaning |
 |--------|---------|
-| `--key FILE` | Identity file, created on first run. |
+| `--key FILE` | Identity file, created on first run. Default: `./ygg.key` if it exists, else `~/ygg.key`. |
 | `--peers FILE` | Use a local peer list instead of downloading the public one. |
 | `--no-public` | Do not download the public peer list. Use `--peers` and LAN only. |
 | `--target N` | Outbound peers to keep connected (1..=32, default 3). |
 | `--allow KEY` | Allow an overlay key to use forwards, ping and the page. Repeatable. |
 | `--forward PORTS` | Expose local TCP ports over Yggdrasil, e.g. `22,2222:22`. Up to 16 ports. |
+| `--connect LPORT:[ADDR]:PORT` | Listen on 127.0.0.1:LPORT and carry each connection to `[ADDR]:PORT` over Yggdrasil. Repeatable. |
 | `--api ADDR` | Status server with dashboard and `/api/stats`. No authentication: bind to 127.0.0.1. |
 | `--html FILE` | Replace the default page on overlay port 80. |
 | `--ping ADDR` | Send one echo request per second and print round-trip times. |
@@ -174,9 +187,16 @@ proxy) and an allowed key:
 ssh -o ProxyCommand="nc -X 5 -x 127.0.0.1:1080 %h %p" -p 22 root@<device-address>
 ```
 
-Limits of the built-in TCP: one connection per client port, no congestion control, no
-TIME_WAIT. Meant for interactive sessions, not bulk transfers. Forwarding overlay port 80
-disables the status page.
+Outgoing direction: `--connect 2222:[<device-address>]:22` lets `ssh -p 2222 root@127.0.0.1`
+reach the device from a host that runs `tcp_node` only (no TUN, no yggstack).
+
+The built-in TCP (`src/tcp_stack.rs`) is a full implementation: RFC 9293 state machine
+with TIME-WAIT and half-close, MSS and window scaling (up to 256 KiB windows), flow
+control with zero-window probing, delayed ACKs, out-of-order reassembly, RTO per RFC 6298,
+NewReno congestion control (slow start, fast retransmit/recovery), keepalive, keyed
+initial sequence numbers and RST/SYN checks per RFC 5961. Not implemented: SACK and
+timestamps. Over a direct link between two nodes an 8 MB transfer runs at ~18 MB/s.
+Forwarding overlay port 80 disables the status page.
 
 ### Building for a router (OpenWrt)
 
@@ -303,7 +323,19 @@ cargo test --features upstream-tls --bin tcp_node upstream_beacon
 
 ### Запуск `tcp_node`
 
-Простой запуск с публичным списком пиров (загружается при старте):
+Самый простой запуск, без параметров:
+
+```sh
+./tcp_node
+```
+
+Узел загружает или создаёт ключ (`./ygg.key`, если он есть, иначе `~/ygg.key`), в фоне
+скачивает публичный список пиров (curl, wget или `uclient-fetch` на OpenWrt), проверяет
+кандидатов и подключается. Список сохраняется в `peers-cache.json` рядом с ключом и при
+следующем старте используется сразу; неудачная загрузка повторяется раз в минуту,
+удачная обновляется раз в 6 часов.
+
+С параметрами:
 
 ```sh
 ./target/release/tcp_node --key ~/ygg.key --target 3 --api 127.0.0.1:8080
@@ -322,12 +354,13 @@ cargo test --features upstream-tls --bin tcp_node upstream_beacon
 
 | Опция | Назначение |
 |-------|------------|
-| `--key FILE` | Файл идентичности, создаётся при первом запуске. |
+| `--key FILE` | Файл идентичности, создаётся при первом запуске. По умолчанию `./ygg.key`, если есть, иначе `~/ygg.key`. |
 | `--peers FILE` | Использовать локальный список пиров вместо публичного. |
 | `--no-public` | Не загружать публичный список пиров. Только `--peers` и LAN. |
 | `--target N` | Сколько исходящих пиров держать (1..=32, по умолчанию 3). |
 | `--allow KEY` | Разрешить ключу оверлея пользоваться проброской, ping и страницей. Можно несколько раз. |
 | `--forward PORTS` | Открыть локальные TCP-порты через Yggdrasil, например `22,2222:22`. До 16 портов. |
+| `--connect LPORT:[ADDR]:PORT` | Слушать 127.0.0.1:LPORT и передавать каждое соединение на `[ADDR]:PORT` через Yggdrasil. Можно повторять. |
 | `--api ADDR` | Сервер статуса с дашбордом и `/api/stats`. Без аутентификации: привязывайте к 127.0.0.1. |
 | `--html FILE` | Заменить страницу по умолчанию на порту оверлея 80. |
 | `--ping ADDR` | Раз в секунду посылать echo-запрос и печатать время ответа. |
@@ -410,9 +443,16 @@ tcp_node --key ~/ygg.key --peers ~/peers.json \
 ssh -o ProxyCommand="nc -X 5 -x 127.0.0.1:1080 %h %p" -p 22 root@<адрес-устройства>
 ```
 
-Ограничения встроенного TCP: одно соединение на порт клиента, нет управления перегрузкой,
-нет TIME_WAIT. Подходит для интерактивных сессий, а не для больших передач. Проброс порта
-80 оверлея отключает страницу статуса.
+Обратное направление: `--connect 2222:[<адрес-устройства>]:22` позволяет выполнить
+`ssh -p 2222 root@127.0.0.1` с машины, где запущен только `tcp_node` (без TUN и yggstack).
+
+Встроенный TCP (`src/tcp_stack.rs`) полноценный: машина состояний RFC 9293 с TIME-WAIT и
+полузакрытием, опции MSS и масштабирования окна (окна до 256 КиБ), управление потоком с
+пробами нулевого окна, отложенные ACK, сборка сегментов не по порядку, RTO по RFC 6298,
+управление перегрузкой NewReno (медленный старт, быстрый повтор и восстановление),
+keepalive, ISN по ключевому хешу и проверки RST/SYN по RFC 5961. Не реализованы SACK и
+метки времени. По прямому соединению двух узлов 8 МБ передаются со скоростью ~18 МБ/с.
+Проброс порта 80 оверлея отключает страницу статуса.
 
 ### Сборка для роутера (OpenWrt)
 

@@ -2,3 +2,10 @@
 /examples/*/target
 tests/keys/
 
+
+# Local identity and build output
+ygg.key
+*.key
+/target-*
+*.bak
+peers-cache.json

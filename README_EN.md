@@ -25,13 +25,14 @@ static binary.
 
 | Flag | Description |
 |------|-------------|
-| `--key FILE` | Key file (64 hex). Created on first run with mode 600; defines the node address — keep it secret |
+| `--key FILE` | Key file (64 hex). Created on first run with mode 600; defines the node address — keep it secret. Default: `./ygg.key` if present, else `~/ygg.key`. With no options at all the node downloads the public peer list in the background and connects |
 | `--peers FILE` | JSON list of public peers (`publicnodes.json`) |
 | `--target N` | Number of outgoing slots (1..32, default 3) |
 | `--allow KEY` | Allowed public key (repeatable). Datagrams from other keys are dropped |
 | `--api ADDR` | HTTP status server (dashboard + JSON). Listens on loopback only |
 | `--html FILE` | Custom HTML page for the node page |
 | `--forward PORTS` | TCP port forwarding (up to 16) |
+| `--connect LPORT:[ADDR]:PORT` | Carry connections to 127.0.0.1:LPORT to `[ADDR]:PORT` over Yggdrasil |
 | `--forward-udp PORTS` | UDP port forwarding (up to 16) |
 | `--listen PORT` | Accept incoming TCP peers (up to 16 on top of `--target`); the port is announced in LAN beacons |
 | `--lan` | Find peers on the local network via multicast beacons |
@@ -159,11 +160,12 @@ proxy on 127.0.0.1:1080:
 ssh -o ProxyCommand="nc -X 5 -x 127.0.0.1:1080 %h %p" -p 22 root@<device-address>
 ```
 
-### Limitations of the built-in TCP
+### The built-in TCP
 
-For interactive sessions (SSH), not bulk transfers: one connection per client
-port, no congestion control, no TIME_WAIT; when port 80 is forwarded, the
-node's status page is disabled.
+`src/tcp_stack.rs` is a full TCP: RFC 9293 states with TIME-WAIT and half-close,
+MSS and window scaling, flow control, delayed ACKs, out-of-order reassembly,
+RFC 6298 RTO, NewReno congestion control, keepalive, RFC 5961 checks. No SACK
+or timestamps. When port 80 is forwarded, the node's status page is disabled.
 
 ## UDP port forwarding (`--forward-udp`)
 
