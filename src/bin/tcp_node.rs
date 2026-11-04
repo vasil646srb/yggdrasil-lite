@@ -162,14 +162,12 @@ fn spawn_probe_round(uris: Vec<TcpPeerUri>, tx: &mpsc::Sender<(TcpPeerUri, Optio
 /// so this build uses IPv4 multicast and advertises plain IPv4 addresses.
 /// Upper bound for accepted inbound connections (on top of `--target`).
 const MAX_INBOUND: usize = 16;
-/// Root latency above this (ms) triggers replacement of the slowest outbound peer.
-const ROOT_RTT_LIMIT_MS: u64 = 200;
-/// Latency to an allowed client above this (ms) also triggers replacement.
-const CLIENT_RTT_LIMIT_MS: u64 = 150;
-/// While the root is slow, it is probed this often, so peers are replaced one at a time on fresh results.
+/// Latency limits of the peer search (`yggdrasil_lite::search`). Allowed clients decide first;
+/// the root decides only while no client has a fresh measurement.
+const CLIENT_RTT_LIMIT_MS: u64 = search::CLIENT_LIMIT_MS;
+const ROOT_RTT_LIMIT_MS: u64 = search::ROOT_LIMIT_MS;
+/// While the root decides and is slow, it is probed this often, so peers are replaced one at a time on fresh results.
 const SEARCH_PROBE_INTERVAL: Duration = Duration::from_secs(30);
-/// Minimum time between two peer replacements.
-const SWAP_MIN_INTERVAL: Duration = Duration::from_secs(30);
 /// A peer replaced for a high root latency is not redialed for this long.
 const SLOW_PEER_COOLDOWN_MS: u64 = 15 * 60 * 1000;
 
@@ -180,6 +178,7 @@ use yggdrasil_lite::peerlist::DEFAULT_PUBLIC_PEERS_URL;
 use yggdrasil_lite::uri::TcpPeerUri;
 use yggdrasil_lite::{CloseReason, ConnId, TcpEvent};
 use yggdrasil_lite::quality::{PeerView, Quality, Verdict, DEFAULT_RECHECK_MS};
+use yggdrasil_lite::search::{self, droppable, Metric, PeerSearch, SearchConfig};
 use yggdrasil_lite::address::addr_for_key;
 use yggdrasil_lite::{frame_ipv6, unframe_ipv6, udp, Action, Address, CandidateSource, Direction, Endpoint, PublicKey};
 
@@ -1098,7 +1097,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut first_round = true;
     let probe_start = Instant::now();
     ep.set_dial_enabled(false);
-    let mut last_swap = Instant::now() - SWAP_MIN_INTERVAL;
+    let mut finder = PeerSearch::new(SearchConfig::default());
     let mut allow_sent: HashMap<PublicKey, (u64, ProbeNonce)> = HashMap::new();
     let mut last_allow_probe = Instant::now() - ALLOW_PROBE_INTERVAL;
     overlay.allow_keys = allow_keys.clone();
@@ -1331,12 +1330,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                             if let Some(sent) = take_probe(&mut allow_sent, &msg.from_key, &echo.payload) {
                                 let sample = now.saturating_sub(sent);
                                 overlay.allow_rtt.insert(msg.from_key, (sample, now));
+                                finder.record_client(&msg.from_key, sample, now);
                             }
                         }
                         ROOT_PROBE_SEQ => {
                             if let Some((root, sent, nonce)) = root_probe {
                                 if root == msg.from_key && nonce.as_slice() == echo.payload.as_slice() {
-                                    quality.record_root_rtt(now.saturating_sub(sent));
+                                    let sample = now.saturating_sub(sent);
+                                    quality.record_root_rtt(sample);
+                                    finder.record_root(sample, now);
                                     root_probe = None;
                                 }
                             }
@@ -1526,59 +1528,51 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
-        // Peer search: replace one slow outbound peer at a time. The root is re-probed every
-        // SEARCH_PROBE_INTERVAL while it is slow; a swap needs a fresh result above the limit.
+        // Peer search: replace one slow outbound peer at a time (see `yggdrasil_lite::search`).
+        // The latency to the allowed keys decides; the root decides only while no allowed key
+        // answers, and is then re-probed every SEARCH_PROBE_INTERVAL while it is slow.
         {
             let me = *ep.public_key();
-            // A swap needs a fresh root measurement above the limit. `searching` only keeps
-            // the root probes going until a measurement comes back under the limit.
-            let root_fresh = quality.root_rtt();
-            if let Some(rtt) = root_fresh {
-                overlay.searching = rtt > ROOT_RTT_LIMIT_MS;
+            if let Some(o) = finder.take_outcome() {
+                let msg = if o.helped {
+                    format!("замена помогла: {} -> {} ms", metric_text(o.before), o.after)
+                } else {
+                    format!(
+                        "замена не помогла: {} -> {} ms, следующая не раньше чем через {} с",
+                        metric_text(o.before),
+                        o.after,
+                        o.next_wait_ms / 1000
+                    )
+                };
+                println!("{msg}");
+                push_swap(&mut overlay, msg);
             }
-            let root_slow = root_fresh.map_or(false, |r| r > ROOT_RTT_LIMIT_MS)
-                && overlay.root.map_or(false, |r| r != me);
-            let slow_client = overlay
-                .allow_rtt
-                .iter()
-                .filter(|(k, _)| **k != me)
-                .map(|(_, (r, _))| *r)
-                .max()
-                .filter(|r| *r > CLIENT_RTT_LIMIT_MS);
-            if (root_slow || slow_client.is_some()) && last_swap.elapsed() >= SWAP_MIN_INTERVAL {
-                let outbound = ep
-                    .connected_peers()
-                    .iter()
-                    .filter(|p| p.direction == Direction::Outbound)
-                    .count();
-                if ep.candidates().len() > outbound {
-                    if let Some(worst) = worst_outbound(&ep, &quality) {
-                        let msg = if root_slow {
-                            format!(
-                                "корень {} ms > {ROOT_RTT_LIMIT_MS} ms: заменён пир {}",
-                                root_fresh.unwrap_or(0),
-                                short_key(&worst)
-                            )
-                        } else {
-                            format!(
-                                "клиент {} ms > {CLIENT_RTT_LIMIT_MS} ms: заменён пир {}",
-                                slow_client.unwrap_or(0),
-                                short_key(&worst)
-                            )
-                        };
-                        println!("{msg}");
-                        overlay.swaps.push(msg);
-                        if overlay.swaps.len() > 5 {
-                            overlay.swaps.remove(0);
-                        }
-                        let acts = ep.drop_peer(&worst, now, SLOW_PEER_COOLDOWN_MS);
-                        run(acts, &mut ep, &mut streams, now);
-                        quality.forget(&worst);
-                        quality.clear_root_rtt();
-                        overlay.allow_rtt.clear();
-                        last_swap = Instant::now();
-                    }
-                }
+            finder.note_healthy(now);
+            overlay.searching = finder.probing_root(now);
+            let outbound = ep.connected_peers().iter().filter(|p| p.direction == Direction::Outbound).count();
+            // Peers that may be replaced: outbound, not found on the LAN, and not an allowed key
+            // (an allowed key connected directly is the shortest path to that client).
+            let candidates_to_drop = droppable(
+                ep.connected_peers()
+                    .into_iter()
+                    .filter(|p| p.direction == Direction::Outbound && !p.lan)
+                    .map(|p| (p.key, quality.rtt(&p.key).or(p.rtt_ms))),
+                &allow_keys,
+            );
+            if let Some(d) = finder.decide(now, &candidates_to_drop, ep.candidates().len() > outbound) {
+                let limit = match d.metric {
+                    Metric::Client(_) => CLIENT_RTT_LIMIT_MS,
+                    Metric::Root(_) => ROOT_RTT_LIMIT_MS,
+                };
+                let msg = format!("{} > {limit} ms: заменён пир {}", metric_text(d.metric), short_key(&d.drop));
+                println!("{msg}");
+                push_swap(&mut overlay, msg);
+                let acts = ep.drop_peer(&d.drop, now, SLOW_PEER_COOLDOWN_MS);
+                run(acts, &mut ep, &mut streams, now);
+                quality.forget(&d.drop);
+                quality.clear_root_rtt();
+                overlay.allow_rtt.clear();
+                finder.swapped(now, &d);
             }
             if overlay.searching && root_probe.is_none() && search_probe.elapsed() >= SEARCH_PROBE_INTERVAL {
                 if let Some(root) = overlay.root.filter(|r| *r != me) {
@@ -1712,7 +1706,7 @@ struct OverlayInfo {
     allow_rtt: HashMap<PublicKey, (u64, u64)>,
     /// Root of the global network from the last evaluation.
     root: Option<PublicKey>,
-    /// True while the root latency is above the limit.
+    /// True while the root decides the peer search and is above its limit: it is re-probed.
     searching: bool,
 }
 
@@ -1721,13 +1715,20 @@ fn esc(s: &str) -> String {
 }
 
 /// Slowest connected outbound peer by measured latency (falls back to the pool estimate).
-fn worst_outbound(ep: &Endpoint, quality: &Quality) -> Option<PublicKey> {
-    ep.connected_peers()
-        .into_iter()
-        .filter(|p| p.direction == Direction::Outbound && !p.lan)
-        .filter_map(|p| quality.rtt(&p.key).or(p.rtt_ms).map(|r| (r, p.key)))
-        .max_by_key(|(r, _)| *r)
-        .map(|(_, k)| k)
+/// "клиент 220 ms" / "корень 350 ms": the latency that decided a peer replacement.
+fn metric_text(m: Metric) -> String {
+    match m {
+        Metric::Client(r) => format!("клиент {r} ms"),
+        Metric::Root(r) => format!("корень {r} ms"),
+    }
+}
+
+/// Keep the last few peer replacements for the status page.
+fn push_swap(overlay: &mut OverlayInfo, msg: String) {
+    overlay.swaps.push(msg);
+    if overlay.swaps.len() > 5 {
+        overlay.swaps.remove(0);
+    }
 }
 
 /// Live update for the overlay status page: re-fetch the page every 2 s and swap the body in place.
@@ -1880,7 +1881,7 @@ td,th{{border:1px solid #ccc;padding:4px 6px;text-align:left}}.ok{{color:#080}}.
 <tr><th>пиры на главном корне</th><td>{global_n}</td></tr>\
 <tr><th>на чужом корне</th><td>{foreign_n}</td></tr>\
 <tr><th>не определены</th><td>{unknown_n}</td></tr>\
-<tr><th>порог замены</th><td>корень {ROOT_RTT_LIMIT_MS} ms, клиент {CLIENT_RTT_LIMIT_MS} ms</td></tr>\
+<tr><th>порог замены</th><td>клиент {CLIENT_RTT_LIMIT_MS} ms (приоритет), корень {ROOT_RTT_LIMIT_MS} ms (если клиенты не отвечают)</td></tr>\
 <tr><th>последняя оценка</th><td>{eval_text}</td></tr>\
 </table>\
 <h2>Пиры (--target {target})</h2>\

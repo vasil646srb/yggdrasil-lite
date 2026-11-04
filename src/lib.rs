@@ -60,6 +60,7 @@ pub mod tcp;
 pub mod tcp_stack;
 pub mod http;
 pub mod quality;
+pub mod search;
 
 // Re-export the main public types for convenience.
 pub use node::{YggdrasilLite, LiteConfig, NodeEvent};
