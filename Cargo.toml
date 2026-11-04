@@ -55,6 +55,10 @@ required-features = ["std"]
 name = "gen_test_keys"
 required-features = ["std"]
 
-# Smaller binaries for routers: symbols stripped.
+# Smaller binaries for routers: symbols stripped, whole-program LTO, no unwinding.
+# For an even smaller binary (~15% less) at some speed cost use opt-level = "s".
 [profile.release]
 strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
