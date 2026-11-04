@@ -16,10 +16,31 @@ and fixes that are not part of the upstream.
 
 `tcp_node` (`src/bin/tcp_node.rs`) is an executable yggdrasil-lite node for
 **Termux, Linux and OpenWrt**. It connects to public TCP peers, works as a
-leaf node, measures latency to candidates and replaces slow peers itself,
-serves status over HTTP and forwards TCP and UDP ports over Yggdrasil. It
-only depends on `rand` and `heapless` — no TLS, no C libraries, a compact
-static binary.
+leaf node, measures latency to candidates and replaces slow peers itself
+and forwards TCP and UDP ports over Yggdrasil. The plain build depends only
+on `rand`, `heapless` and `libc` — no TLS, no C libraries, a compact static
+binary. TLS with LAN peer discovery and the HTML status server are optional
+build variants (see below).
+
+### Build variants
+
+Four variants are built from two optional features. Every variant forwards TCP
+and UDP (`--forward`, `--connect`, `--forward-udp`):
+
+| Variant | Features | Adds |
+|---------|----------|------|
+| `tcp_node-tcp` | none | Nothing: TCP peers only, no TLS, no LAN discovery, no HTML server. |
+| `tcp_node-tls` | `upstream-tls` | `tls://` peers and yggdrasil-go LAN peer discovery (`--lan-upstream`). |
+| `tcp_node-html` | `html` | HTML server on port 1080 (dashboard + JSON API, overlay status page). |
+| `tcp_node-tls-html` | `upstream-tls,html` | Both. |
+
+```sh
+scripts/build-variants.sh                                    # all four, into dist/host/
+scripts/build-variants.sh --target mipsel-unknown-linux-musl   # router: nightly + build-std
+```
+
+Sizes on x86_64: 0.95 MB, 2.1 MB, 0.98 MB, 2.1 MB. A flag of a feature that is
+not built in is refused at start. The TLS variants use rustls (no OpenSSL).
 
 ### Flags
 
@@ -29,8 +50,9 @@ static binary.
 | `--peers FILE` | JSON list of public peers (`publicnodes.json`) |
 | `--target N` | Number of outgoing slots (1..32, default 3) |
 | `--allow KEY` | Allowed public key (repeatable). Datagrams from other keys are dropped |
-| `--api ADDR` | HTTP status server (dashboard + JSON). Listens on loopback only |
-| `--html FILE` | Custom HTML page for the node page |
+| `--api ADDR\|off` | `html` build. HTTP status server (dashboard + JSON), default `127.0.0.1:<html-port>`. Loopback only |
+| `--html FILE` | `html` build. Custom HTML page for the node page |
+| `--html-port PORT` | `html` build. Overlay port of the page and port of the local dashboard (default 1080) |
 | `--forward PORTS` | TCP port forwarding (up to 16) |
 | `--connect LPORT:[ADDR]:PORT` | Carry connections to 127.0.0.1:LPORT to `[ADDR]:PORT` over Yggdrasil |
 | `--forward-udp PORTS` | UDP port forwarding (up to 16) |
@@ -109,14 +131,15 @@ addresses:
    far away does not make the node churn through every public peer. The
    decision logic lives in `src/search.rs` and is covered by unit tests.
 
-### Node page on port 80 and API
+### Node page on port 1080 and API (`html` build)
 
-The node answers ICMPv6 echo from allowed keys and serves a status page on the
-overlay TCP port 80 (unless port 80 is taken by a forwarded port). Open it
-from a node whose key is in `--allow`, via a yggstack SOCKS proxy:
+The node always answers ICMPv6 echo from allowed keys. The `html` build also serves a
+status page on the overlay TCP port 1080 (`--html-port`; unless that port is taken by a
+forwarded port) and a local dashboard with `/api/stats` on `127.0.0.1:1080`. Open the
+overlay page from a node whose key is in `--allow`, via a yggstack SOCKS proxy:
 
 ```sh
-curl -x socks5h://127.0.0.1:1080 http://[<device-address>]/
+curl -x socks5h://127.0.0.1:1080 http://[<device-address>]:1080/
 ```
 
 The page refreshes every second and shows:
@@ -175,7 +198,7 @@ ssh -o ProxyCommand="nc -X 5 -x 127.0.0.1:1080 %h %p" -p 22 root@<device-address
 `src/tcp_stack.rs` is a full TCP: RFC 9293 states with TIME-WAIT and half-close,
 MSS and window scaling, flow control, delayed ACKs, out-of-order reassembly,
 RFC 6298 RTO, NewReno congestion control, keepalive, RFC 5961 checks. No SACK
-or timestamps. When port 80 is forwarded, the node's status page is disabled.
+or timestamps. When the HTML port is forwarded, the node's status page is disabled.
 
 ## UDP port forwarding (`--forward-udp`)
 

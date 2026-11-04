@@ -38,6 +38,34 @@ for Termux (Android), Linux and OpenWrt routers.
 - `tests/` — end-to-end scripts and transit tests.
 - `openwrt/tcp_node.init` — OpenWrt service script.
 
+### Build variants
+
+`tcp_node` is built in four variants from two optional features. Every variant forwards TCP
+and UDP over Yggdrasil (`--forward`, `--connect`, `--forward-udp`); the features only add parts:
+
+| Variant | Features | Adds |
+|---------|----------|------|
+| `tcp_node-tcp` | none | Nothing: TCP peers only, no TLS, no LAN discovery, no HTML server. |
+| `tcp_node-tls` | `upstream-tls` | `tls://` peers and yggdrasil-go LAN peer discovery (`--lan-upstream`). |
+| `tcp_node-html` | `html` | HTML server on port 1080 (dashboard + JSON API, overlay status page). |
+| `tcp_node-tls-html` | `upstream-tls,html` | Both. |
+
+```sh
+scripts/build-variants.sh                                   # all four, into dist/host/
+scripts/build-variants.sh --target mipsel-unknown-linux-musl  # for a router (see below)
+cargo build --release --bin tcp_node --features upstream-tls,html   # one variant by hand
+```
+
+Sizes on x86_64: 0.95 MB, 2.1 MB, 0.98 MB, 2.1 MB. A flag of a feature that is not built in is
+refused at start (for example `--api needs a build with --features html`).
+
+The HTML server (`html` builds) uses one port, `--html-port` (default **1080**): the status
+page is served on that overlay TCP port to allowed keys, and the dashboard with `/api/stats`
+on `127.0.0.1:1080` (loopback only, no authentication; `--api ADDR` changes the address and
+`--api off` disables it). If the default local port is taken the dashboard is skipped with a
+warning; an explicit `--api` that cannot bind is an error. Earlier builds served the overlay
+page on port 80: use `--html-port 80` for that.
+
 ### Building `tcp_node`
 
 Plain build (no TLS, no C libraries; depends only on `rand` and `heapless`):
@@ -107,12 +135,13 @@ address, so keep it private.
 | `--allow KEY` | Allow an overlay key to use forwards, ping and the page. Repeatable. |
 | `--forward PORTS` | Expose local TCP ports over Yggdrasil, e.g. `22,2222:22`. Up to 16 ports. |
 | `--connect LPORT:[ADDR]:PORT` | Listen on 127.0.0.1:LPORT and carry each connection to `[ADDR]:PORT` over Yggdrasil. Repeatable. |
-| `--api ADDR` | Status server with dashboard and `/api/stats`. No authentication: bind to 127.0.0.1. |
-| `--html FILE` | Replace the default page on overlay port 80. |
+| `--api ADDR\|off` | `html` build. Local dashboard and `/api/stats`, default `127.0.0.1:<html-port>`. No authentication: loopback only. |
+| `--html FILE` | `html` build. Replace the default page on the overlay HTML port. |
+| `--html-port PORT` | `html` build. Overlay port of the page and port of the local dashboard (default 1080). |
 | `--ping ADDR` | Send one echo request per second and print round-trip times. |
 | `--quality-interval SECS` | How often the global network is rechecked (default 300). |
-| `--lan-upstream` | LAN discovery of yggdrasil-go peers over IPv6 link-local (`ff02::114:9001`), dialled over TLS. Needs the `upstream-tls` build. |
-| `--lan-target N` | Outbound slots reserved for LAN peers (default: `--target`). |
+| `--lan-upstream` | `upstream-tls` build. LAN discovery of yggdrasil-go peers over IPv6 link-local (`ff02::114:9001`), dialled over TLS. |
+| `--lan-target N` | `upstream-tls` build. Outbound slots reserved for LAN peers (default: `--target`). |
 | `--listen PORT` | Accept plain TCP inbound peers on this port. |
 
 
@@ -198,7 +227,7 @@ control with zero-window probing, delayed ACKs, out-of-order reassembly, RTO per
 NewReno congestion control (slow start, fast retransmit/recovery), keepalive, keyed
 initial sequence numbers and RST/SYN checks per RFC 5961. Not implemented: SACK and
 timestamps. Over a direct link between two nodes an 8 MB transfer runs at ~18 MB/s.
-Forwarding overlay port 80 disables the status page.
+Forwarding the HTML port (1080 by default) disables the status page.
 
 ### Building for a router (OpenWrt)
 
@@ -294,6 +323,35 @@ Termux (Android), Linux и роутеров OpenWrt.
 - Поиск пиров **yggdrasil-go** в локальной сети по их беаконам IPv6 link-local
   (`--lan-upstream`), подключение по TLS (необязательная feature `upstream-tls`).
 
+### Варианты сборки
+
+`tcp_node` собирается в четырёх вариантах из двух необязательных feature. Во всех вариантах
+работает проброс TCP и UDP через Yggdrasil (`--forward`, `--connect`, `--forward-udp`),
+feature лишь добавляют части:
+
+| Вариант | Features | Добавляет |
+|---------|----------|-----------|
+| `tcp_node-tcp` | нет | Ничего: только TCP-пиры, без TLS, без поиска в LAN, без HTML-сервера. |
+| `tcp_node-tls` | `upstream-tls` | Пиры `tls://` и поиск пиров yggdrasil-go в LAN (`--lan-upstream`). |
+| `tcp_node-html` | `html` | HTML-сервер на порту 1080 (панель + JSON API, страница по оверлею). |
+| `tcp_node-tls-html` | `upstream-tls,html` | И то и другое. |
+
+```sh
+scripts/build-variants.sh                                   # все четыре в dist/host/
+scripts/build-variants.sh --target mipsel-unknown-linux-musl  # для роутера (см. ниже)
+cargo build --release --bin tcp_node --features upstream-tls,html   # один вариант вручную
+```
+
+Размеры на x86_64: 0,95 МБ, 2,1 МБ, 0,98 МБ, 2,1 МБ. Флаг отсутствующей в сборке feature
+отвергается при запуске (например, `--api needs a build with --features html`).
+
+HTML-сервер (сборки `html`) использует один порт, `--html-port` (по умолчанию **1080**):
+страница статуса отдаётся на этом TCP-порту оверлея разрешённым ключам, а панель с
+`/api/stats` на `127.0.0.1:1080` (только loopback, без аутентификации; `--api ADDR` меняет
+адрес, `--api off` отключает). Если порт по умолчанию занят, панель пропускается с
+предупреждением; явный `--api`, который нельзя занять, считается ошибкой. Раньше страница
+по оверлею отдавалась на порту 80: для этого используйте `--html-port 80`.
+
 ### Структура репозитория
 
 - `src/` — библиотека (`YggdrasilLite`, формат пакетов, метаданные, сессии).
@@ -372,12 +430,13 @@ cargo test --features upstream-tls --bin tcp_node upstream_beacon
 | `--allow KEY` | Разрешить ключу оверлея пользоваться проброской, ping и страницей. Можно несколько раз. |
 | `--forward PORTS` | Открыть локальные TCP-порты через Yggdrasil, например `22,2222:22`. До 16 портов. |
 | `--connect LPORT:[ADDR]:PORT` | Слушать 127.0.0.1:LPORT и передавать каждое соединение на `[ADDR]:PORT` через Yggdrasil. Можно повторять. |
-| `--api ADDR` | Сервер статуса с дашбордом и `/api/stats`. Без аутентификации: привязывайте к 127.0.0.1. |
-| `--html FILE` | Заменить страницу по умолчанию на порту оверлея 80. |
+| `--api ADDR\|off` | Сборка `html`. Локальная панель и `/api/stats`, по умолчанию `127.0.0.1:<html-port>`. Без аутентификации: только loopback. |
+| `--html FILE` | Сборка `html`. Заменить страницу по умолчанию на HTML-порту оверлея. |
+| `--html-port PORT` | Сборка `html`. Порт оверлея для страницы и порт локальной панели (по умолчанию 1080). |
 | `--ping ADDR` | Раз в секунду посылать echo-запрос и печатать время ответа. |
 | `--quality-interval SECS` | Как часто перепроверять глобальную сеть (по умолчанию 300). |
-| `--lan-upstream` | Поиск пиров yggdrasil-go в LAN через IPv6 link-local (`ff02::114:9001`), подключение по TLS. Нужна сборка с `upstream-tls`. |
-| `--lan-target N` | Исходящие слоты, отведённые под пиров из LAN (по умолчанию `--target`). |
+| `--lan-upstream` | Сборка `upstream-tls`. Поиск пиров yggdrasil-go в LAN через IPv6 link-local (`ff02::114:9001`), подключение по TLS. |
+| `--lan-target N` | Сборка `upstream-tls`. Исходящие слоты, отведённые под пиров из LAN (по умолчанию `--target`). |
 | `--listen PORT` | Принимать входящие пиры по обычному TCP на этом порту. |
 
 
