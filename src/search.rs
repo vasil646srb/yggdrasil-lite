@@ -9,8 +9,9 @@
 //!    measurement (none configured, or all silent). A silent client is not treated as slow: it
 //!    may simply be offline.
 //!
-//! The metric must exceed its limit before a peer is replaced, and samples are smoothed, so one
-//! slow echo does not cost a peer. The peer to drop is the outbound one with the highest direct
+//! The metric must exceed its limit before a peer is replaced, the first echo of a run is thrown
+//! away (it pays for path discovery) and the rest are smoothed, so neither a cold start nor one
+//! slow echo costs a peer. The peer to drop is the outbound one with the highest direct
 //! latency; the caller leaves out peers it wants to keep (allowed keys connected directly, LAN
 //! peers). Replacements are rate limited, and each one is judged afterwards: if the metric did
 //! not improve, the next replacement waits twice as long (up to a maximum), so a client that is
@@ -38,9 +39,13 @@ pub struct SearchConfig {
     pub client_limit_ms: u64,
     /// A sample older than this no longer counts.
     pub sample_ttl_ms: u64,
-    /// Samples needed before a latency counts. The first echo to a node pays for path discovery
-    /// and the session handshake, so it says little about the path itself.
+    /// Samples needed before a latency counts.
     pub min_samples: u32,
+    /// Leading samples of a run that are thrown away. The first echo to a node pays for path
+    /// discovery and the session handshake (seconds, against a round trip of tens of
+    /// milliseconds), so it says nothing about the path and would poison the average and the
+    /// baseline the next replacement is judged against.
+    pub warmup: u32,
     /// Minimum time between two replacements while replacements help.
     pub min_interval_ms: u64,
     /// Longest wait between replacements after unhelpful ones.
@@ -58,6 +63,7 @@ impl Default for SearchConfig {
             client_limit_ms: CLIENT_LIMIT_MS,
             sample_ttl_ms: 45_000,
             min_samples: 2,
+            warmup: 1,
             min_interval_ms: 30_000,
             max_interval_ms: 10 * 60_000,
             settle_ms: 60_000,
@@ -135,29 +141,31 @@ impl PeerSearch {
         }
     }
 
-    fn smooth(old: Option<Entry>, sample: u64, now: u64, ttl: u64) -> Entry {
+    fn smooth(old: Option<Entry>, sample: u64, now: u64, ttl: u64, warmup: u32) -> Entry {
         match old {
             // A stale average says nothing about the path now: start over.
             Some((avg, at, n)) if now.saturating_sub(at) <= ttl => {
-                ((avg * (EWMA_DIV - 1) + sample) / EWMA_DIV, now, n.saturating_add(1))
+                // While still in the warm-up the earlier samples are replaced, not averaged in.
+                let avg = if n <= warmup { sample } else { (avg * (EWMA_DIV - 1) + sample) / EWMA_DIV };
+                (avg, now, n.saturating_add(1))
             }
             _ => (sample, now, 1),
         }
     }
 
     fn counts(&self, e: &Entry, now: u64) -> bool {
-        now.saturating_sub(e.1) <= self.cfg.sample_ttl_ms && e.2 >= self.cfg.min_samples
+        now.saturating_sub(e.1) <= self.cfg.sample_ttl_ms && e.2 >= self.cfg.min_samples.max(self.cfg.warmup + 1)
     }
 
     /// One echo round trip to the address of an allowed key.
     pub fn record_client(&mut self, key: &PublicKey, sample_ms: u64, now: u64) {
-        let e = Self::smooth(self.clients.get(key).copied(), sample_ms, now, self.cfg.sample_ttl_ms);
+        let e = Self::smooth(self.clients.get(key).copied(), sample_ms, now, self.cfg.sample_ttl_ms, self.cfg.warmup);
         self.clients.insert(*key, e);
     }
 
     /// One echo round trip to the global root.
     pub fn record_root(&mut self, sample_ms: u64, now: u64) {
-        self.root = Some(Self::smooth(self.root, sample_ms, now, self.cfg.sample_ttl_ms));
+        self.root = Some(Self::smooth(self.root, sample_ms, now, self.cfg.sample_ttl_ms, self.cfg.warmup));
     }
 
     /// Worst smoothed round trip over the allowed keys with a fresh sample.
@@ -287,7 +295,7 @@ mod tests {
 
     /// Config for tests that feed single samples.
     fn one_sample() -> SearchConfig {
-        SearchConfig { min_samples: 1, ..SearchConfig::default() }
+        SearchConfig { min_samples: 1, warmup: 0, ..SearchConfig::default() }
     }
 
     fn key(n: u8) -> PublicKey {
@@ -452,18 +460,42 @@ mod tests {
     }
 
     #[test]
-    fn a_single_sample_does_not_count() {
+    fn the_first_echo_is_thrown_away() {
         let mut s = PeerSearch::new(SearchConfig::default());
-        s.record_client(&key(9), 900, 1_000); // path discovery and handshake inflate the first echo
-        assert_eq!(s.metric(2_000), None);
+        // Path discovery and the handshake inflate the first echo to seconds.
+        s.record_client(&key(9), 6_500, 1_000);
+        assert_eq!(s.metric(2_000), None, "a single sample never counts");
         assert!(s.decide(2_000, &peers(), true).is_none());
-        s.record_client(&key(9), 80, 11_000); // (900*3 + 80) / 4 = 695: the run is still dominated by it
-        assert_eq!(s.client_rtt(12_000), Some(695));
+        // The second echo is the first real one and replaces it: 80 ms, not an average with 6500.
+        s.record_client(&key(9), 80, 11_000);
+        assert_eq!(s.client_rtt(12_000), Some(80));
+        assert!(s.decide(12_000, &peers(), true).is_none(), "80 ms is fine");
+        // From then on samples are smoothed: (80*3 + 400) / 4 = 160.
+        s.record_client(&key(9), 400, 21_000);
+        assert_eq!(s.client_rtt(22_000), Some(160));
         // A run that went stale starts over, so an old spike cannot haunt the average.
-        s.record_client(&key(9), 70, 100_000);
+        s.record_client(&key(9), 7_000, 100_000);
         assert_eq!(s.client_rtt(100_000), None, "fresh run, one sample");
         s.record_client(&key(9), 70, 110_000);
         assert_eq!(s.client_rtt(111_000), Some(70));
+    }
+
+    #[test]
+    fn a_cold_start_does_not_fake_a_slow_path_or_a_baseline() {
+        let mut s = PeerSearch::new(SearchConfig::default());
+        // Real round trip 200 ms (over the 150 ms limit); the first echo took 6.5 s.
+        s.record_client(&key(9), 6_500, 1_000);
+        s.record_client(&key(9), 200, 11_000);
+        let d = s.decide(12_000, &peers(), true).expect("200 ms is slow");
+        assert_eq!(d.metric, Metric::Client(200), "baseline is the real round trip, not 6500");
+        s.swapped(12_000, &d);
+        // The new peer is just as slow: the verdict must say so.
+        s.record_client(&key(9), 5_000, 20_000);
+        s.record_client(&key(9), 200, 30_000);
+        s.record_client(&key(9), 200, 70_000);
+        assert!(s.decide(72_000, &peers(), true).is_none());
+        let o = s.take_outcome().expect("verdict");
+        assert!(!o.helped, "200 ms -> 200 ms did not help: {o:?}");
     }
 
     #[test]
