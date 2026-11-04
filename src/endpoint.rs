@@ -385,6 +385,12 @@ impl Endpoint {
         self.tcp.connections()
     }
 
+    /// Time of the earliest TCP timer (retransmission, delayed ACK, keepalive, ...) on the
+    /// clock passed to [`poll`](Self::poll), or `None` with no TCP connections.
+    pub fn tcp_next_timer(&self) -> Option<u64> {
+        self.tcp.next_timer()
+    }
+
     /// Send an echo request to the Yggdrasil address of `key` (a peer or the root).
     /// The reply arrives through [`recv`](Self::recv) with `from_key == key`.
     pub fn ping_key(

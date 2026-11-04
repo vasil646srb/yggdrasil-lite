@@ -1086,6 +1086,36 @@ impl TcpStack {
         }
     }
 
+    /// Earliest time (same clock as [`poll`](Self::poll)) at which a timer is due, or `None`
+    /// with no connections. A value at or before `now` means `poll` has work right away.
+    /// Lets the caller sleep until then instead of polling every few milliseconds; it must
+    /// still call `poll` after any segment or application write, since those can make
+    /// output ready without a timer.
+    pub fn next_timer(&self) -> Option<u64> {
+        let mut next: Option<u64> = None;
+        let mut take = |at: u64| next = Some(next.map_or(at, |n| n.min(at)));
+        for t in self.conns.values() {
+            if matches!(t.state, State::TimeWait) {
+                take(t.time_wait_until);
+            }
+            if let Some(at) = t.rexmt_at {
+                take(at);
+            }
+            if let Some(at) = t.persist_at {
+                take(at);
+            }
+            if t.ack_pending {
+                // `poll` sends a pending ACK at once when no delay is armed.
+                take(t.delack_at.unwrap_or(0));
+            }
+            let keepalive_state = matches!(t.state, State::Established | State::CloseWait | State::FinWait2);
+            if keepalive_state && t.rexmt_at.is_none() && t.persist_at.is_none() {
+                take(t.keepalive_at);
+            }
+        }
+        next
+    }
+
     fn on_rexmt_timeout(&mut self, id: ConnId) {
         let now = self.now;
         let t = self.conns.get_mut(&id).unwrap();
@@ -1885,6 +1915,48 @@ mod tests {
         assert!(sim.a.conns.is_empty() && sim.b.conns.is_empty(), "TIME-WAIT expired");
         let (a2, b2) = sim.open(22);
         transfer(&mut sim, a2, b2, b"again", b"ok", 10_000);
+    }
+
+    #[test]
+    fn next_timer_tracks_the_earliest_timer() {
+        let mut sim = Sim::new(TcpConfig::default());
+        assert_eq!(sim.a.next_timer(), None, "no connections, no timers");
+        let (a, b) = sim.open(22);
+        for _ in 0..100 {
+            sim.step(10);
+        }
+        // Idle established connection: only the keepalive is armed, far in the future.
+        let at = sim.a.next_timer().expect("keepalive armed");
+        assert!(at > sim.now + KEEPALIVE_IDLE_MS / 2 && at <= sim.now + KEEPALIVE_IDLE_MS, "at={at} now={}", sim.now);
+
+        // Data in flight arms the retransmission timer well before the keepalive.
+        sim.a.write(a, b"hello");
+        sim.a.poll(sim.now);
+        let at = sim.a.next_timer().expect("retransmission armed");
+        assert!(at >= sim.now && at <= sim.now + RTO_INIT_MS.max(RTO_MIN_MS) * 2, "at={at} now={}", sim.now);
+
+        // Receiving data arms the delayed ACK on B: due within DELACK_MS.
+        sim.flush();
+        sim.step(sim.delay);
+        if let Some(at) = sim.b.next_timer() {
+            assert!(at <= sim.now + DELACK_MS, "delayed ACK or earlier, at={at} now={}", sim.now);
+        }
+        let _ = b;
+
+        // After the ACKs flow and the connection closes, TIME-WAIT is the last timer, then none.
+        sim.a.close(a);
+        for _ in 0..400 {
+            sim.step(100);
+        }
+        let mut buf = [0u8; 8];
+        sim.b.read(b, &mut buf);
+        sim.b.close(b);
+        for _ in 0..1_000 {
+            sim.step(100);
+        }
+        assert!(sim.a.conns.is_empty() && sim.b.conns.is_empty());
+        assert_eq!(sim.a.next_timer(), None);
+        assert_eq!(sim.b.next_timer(), None);
     }
 
     #[test]

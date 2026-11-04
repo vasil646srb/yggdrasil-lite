@@ -52,6 +52,7 @@ use std::error::Error;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV6, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -392,6 +393,15 @@ impl Bridge {
 
 const BRIDGE_CHUNK: usize = 64 * 1024;
 
+/// Longest wait in the main loop when nothing is ready and no timer is due earlier. The
+/// library's slowest-moving timers are seconds long; this bounds how late the loop's own
+/// periodic jobs and the worker-thread channels (peer list, probes) are noticed.
+const IDLE_WAIT_MS: u64 = 100;
+/// Wait cap while the candidate probe round runs: its workers report over a channel.
+const PROBE_WAIT_MS: u64 = 20;
+/// Wait cap with TLS peers, whose buffered bytes poll cannot see.
+const TLS_WAIT_MS: u64 = 10;
+
 /// Move bytes both ways for one bridge. Returns `false` if the local socket failed.
 fn pump_bridge(ep: &mut Endpoint, id: ConnId, b: &mut Bridge, buf: &mut [u8]) -> bool {
     // Overlay -> local.
@@ -435,6 +445,78 @@ fn pump_bridge(ep: &mut Endpoint, id: ConnId, b: &mut Bridge, buf: &mut [u8]) ->
         }
     }
     true
+}
+
+/// Minimal `poll(2)` binding. std has no readiness API and libc is already linked by std,
+/// so declaring the one function avoids a new dependency (the binary keeps `rand` + `heapless`).
+mod sys {
+    use super::RawFd;
+    use std::os::raw::{c_int, c_ulong};
+    use std::time::Duration;
+
+    pub const IN: i16 = 0x001;
+    pub const OUT: i16 = 0x004;
+
+    #[repr(C)]
+    struct PollFd {
+        fd: c_int,
+        events: i16,
+        revents: i16,
+    }
+
+    extern "C" {
+        fn poll(fds: *mut PollFd, nfds: c_ulong, timeout: c_int) -> c_int;
+    }
+
+    /// A reusable set of descriptors to wait on.
+    #[derive(Default)]
+    pub struct Poller {
+        fds: Vec<PollFd>,
+    }
+
+    impl Poller {
+        pub fn clear(&mut self) {
+            self.fds.clear();
+        }
+
+        /// Watch `fd` for `events` and return its index. With no events the entry is
+        /// ignored by the kernel (fd -1), so a hung-up socket we do not care about
+        /// right now cannot wake the loop.
+        pub fn add(&mut self, fd: RawFd, events: i16) -> usize {
+            let fd = if events == 0 { -1 } else { fd };
+            self.fds.push(PollFd { fd, events, revents: 0 });
+            self.fds.len() - 1
+        }
+
+        /// Block for at most `timeout_ms` until a descriptor is ready.
+        pub fn wait(&mut self, timeout_ms: u64) {
+            for f in &mut self.fds {
+                f.revents = 0;
+            }
+            let timeout = timeout_ms.min(c_int::MAX as u64) as c_int;
+            // SAFETY: `fds` points at `len` initialized `PollFd` (repr(C), the layout of
+            // `struct pollfd`) and stays borrowed for the whole call.
+            let r = unsafe { poll(self.fds.as_mut_ptr(), self.fds.len() as c_ulong, timeout) };
+            if r < 0 {
+                for f in &mut self.fds {
+                    f.revents = 0;
+                }
+                if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                    // poll itself failed: sleep instead of spinning.
+                    std::thread::sleep(Duration::from_millis(timeout_ms.clamp(1, 10)));
+                }
+            }
+        }
+
+        /// Readable, writable, hung up or failed: whatever the caller asked about needs a look.
+        pub fn ready(&self, idx: usize) -> bool {
+            self.fds[idx].revents != 0
+        }
+
+        pub fn any_ready(&self) -> bool {
+            self.fds.iter().any(|f| f.revents != 0)
+        }
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -586,6 +668,24 @@ impl Write for Stream {
 }
 
 impl Stream {
+    fn raw_fd(&self) -> RawFd {
+        match self {
+            Stream::Plain(s) => s.as_raw_fd(),
+            #[cfg(feature = "upstream-tls")]
+            Stream::Tls(s) => s.get_ref().as_raw_fd(),
+        }
+    }
+
+    /// TLS keeps decrypted bytes in its own buffer, which the socket's readiness does not
+    /// show, so such streams are read on every pass.
+    fn buffers_reads(&self) -> bool {
+        match self {
+            Stream::Plain(_) => false,
+            #[cfg(feature = "upstream-tls")]
+            Stream::Tls(_) => true,
+        }
+    }
+
     fn shutdown(&mut self) {
         match self {
             Stream::Plain(s) => {
@@ -1047,7 +1147,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         None => None,
     };
 
+    // The loop sleeps in poll(2) until a socket is ready or a timer is due. `prev_ready` means
+    // the last wait ended because something was ready, so this pass handles input and the next
+    // one (no waiting) must flush what that input queued (ACKs, echo replies, TCP output).
+    let mut poller = sys::Poller::default();
+    let mut ready_slots: HashSet<usize> = HashSet::new();
+    let mut prev_ready = true;
+
     loop {
+        // Work found by means other than socket readiness (worker threads, TLS buffers).
+        let mut activity = false;
         let now = clock(start);
         let actions = ep.poll(now, &mut rng);
         run(actions, &mut ep, &mut streams, now);
@@ -1055,6 +1164,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         // Public peer list from the background fetcher.
         if let Some(rx) = peer_rx.as_ref() {
             while let Ok(res) = rx.try_recv() {
+                activity = true;
                 match res {
                     Ok(json) => {
                         let added = ep.import_peer_list(&json, CandidateSource::Config);
@@ -1146,6 +1256,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
         while let Ok((uri, rtt)) = probe_rx.try_recv() {
+            activity = true;
             if rtt.is_some() {
                 probe_ok += 1;
             }
@@ -1163,6 +1274,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         let slots: Vec<usize> = streams.keys().copied().collect();
         for slot in slots {
+            // Only sockets poll reported (and TLS ones, see `buffers_reads`) are read, so idle
+            // peers cost no system call and no 1 ms read timeout.
+            if !ready_slots.contains(&slot) && !streams.get(&slot).map_or(false, Stream::buffers_reads) {
+                continue;
+            }
             // Keep reading while the buffer comes back full: a busy link would
             // otherwise be limited to one buffer per loop pass.
             for _ in 0..8 {
@@ -1170,6 +1286,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                     Some(s) => s.read(&mut peer_buf),
                     None => break,
                 };
+                if matches!(read, Ok(n) if n > 0) {
+                    activity = true;
+                }
                 match read {
                     Ok(0) => {
                         println!("peer slot {slot}: closed by remote (EOF) at {now} ms");
@@ -1524,10 +1643,57 @@ fn main() -> Result<(), Box<dyn Error>> {
             print_peers(&ep, streams.len(), clock(start));
         }
 
-        // Shorter sleep while forwarded sessions are open, so bytes are not delayed.
-        // Loop period bounds the measured latency: each echo is picked up on the next pass, so
-        // a 100 ms sleep added up to ~200 ms of error per round trip. 10 ms keeps it near the real value.
-        std::thread::sleep(Duration::from_millis(if bridges.is_empty() { 10 } else { 2 }));
+        // Wait for the next event instead of waking on a fixed period: a ready socket ends the
+        // wait at once (so echo replies are timed when they arrive, not on the next tick), and
+        // otherwise the earliest timer decides. The cap covers the periodic jobs above and the
+        // worker threads, which report over channels that poll cannot see.
+        let wait_ms = if prev_ready || activity {
+            0
+        } else {
+            let mut w = IDLE_WAIT_MS;
+            if let Some(at) = ep.tcp_next_timer() {
+                // `.max(1)`: a timer that stays due must never turn the loop into a spin.
+                w = w.min(at.saturating_sub(clock(start)).max(1));
+            }
+            if first_round || probe_pending > 0 {
+                w = w.min(PROBE_WAIT_MS);
+            }
+            if streams.values().any(Stream::buffers_reads) {
+                w = w.min(TLS_WAIT_MS);
+            }
+            w
+        };
+        poller.clear();
+        let stream_idx: Vec<(usize, usize)> =
+            streams.iter().map(|(slot, s)| (*slot, poller.add(s.raw_fd(), sys::IN))).collect();
+        if let Some(l) = listener.as_ref() {
+            poller.add(l.as_raw_fd(), sys::IN);
+        }
+        for (l, _, _) in &connect_listeners {
+            poller.add(l.as_raw_fd(), sys::IN);
+        }
+        if let Some(s) = upstream_sock.as_ref() {
+            poller.add(s.as_raw_fd(), sys::IN);
+        }
+        for s in udp_sessions.values() {
+            poller.add(s.sock.as_raw_fd(), sys::IN);
+        }
+        // A bridge wants input only while the overlay send buffer has room (otherwise a readable
+        // socket would end every wait at once) and output only while bytes wait for the local side.
+        for (id, b) in &bridges {
+            let mut events = 0;
+            if !b.local_eof && ep.tcp_send_space(*id) > 0 {
+                events |= sys::IN;
+            }
+            if b.to_local_off < b.to_local.len() {
+                events |= sys::OUT;
+            }
+            poller.add(b.sock.as_raw_fd(), events);
+        }
+        poller.wait(wait_ms);
+        prev_ready = poller.any_ready();
+        ready_slots.clear();
+        ready_slots.extend(stream_idx.into_iter().filter(|(_, i)| poller.ready(*i)).map(|(slot, _)| slot));
     }
 }
 
