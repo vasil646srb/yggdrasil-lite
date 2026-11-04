@@ -238,6 +238,11 @@ impl PeerSearch {
     /// `spare`: a candidate is available to take the freed slot.
     pub fn decide(&mut self, now: u64, peers: &[(PublicKey, Option<u64>)], spare: bool) -> Option<Decision> {
         self.settle_trial(now);
+        // A replacement is judged before the next one: otherwise a second peer goes while the
+        // first is still settling, and the verdict (and the backoff) never gets a say.
+        if self.trial.is_some() {
+            return None;
+        }
         let metric = self.slow(now)?;
         if self.last_swap.map_or(false, |t| now.saturating_sub(t) < self.wait_ms) || !spare {
             return None;
@@ -378,6 +383,22 @@ mod tests {
         assert!(s.decide(101_000, &peers(), true).is_none(), "39 s after the verdict");
         s.record_client(&key(9), 290, 121_000);
         assert!(s.decide(123_000, &peers(), true).is_some(), "61 s after the verdict");
+    }
+
+    #[test]
+    fn no_second_replacement_while_the_first_is_unjudged() {
+        let mut s = PeerSearch::new(one_sample());
+        s.record_client(&key(9), 300, 0);
+        let d = s.decide(1_000, &peers(), true).unwrap();
+        s.swapped(1_000, &d);
+        // Past the 30 s minimum interval but before the 60 s settle time, with fresh slow samples.
+        s.record_client(&key(9), 300, 34_000);
+        s.record_client(&key(9), 300, 44_000);
+        assert!(s.decide(45_000, &peers(), true).is_none(), "the first replacement is still being judged");
+        // Once judged (not helpful) the wait runs from the verdict.
+        s.record_client(&key(9), 300, 61_000);
+        assert!(s.decide(62_000, &peers(), true).is_none());
+        assert!(s.take_outcome().is_some());
     }
 
     #[test]
