@@ -1297,13 +1297,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         while let Some(msg) = ep.recv() {
+            // Round trips are measured with the clock read now, not the loop pass's `now`: a pass
+            // can take tens of milliseconds on a slow CPU (signature checks), and `now` was read
+            // before all of that.
+            let rx = clock(start);
             let from = Ipv6Addr::from(msg.from.0);
             if let Some(echo) = icmp::parse_echo(unframe_ipv6(&msg.data)) {
                 if echo.kind == ECHO_REPLY && echo.id == QUALITY_ID {
                     match echo.seq {
                         PEER_PROBE_SEQ => {
                             if let Some(sent) = take_probe(&mut probe_sent, &msg.from_key, &echo.payload) {
-                                quality.record_rtt(&msg.from_key, now.saturating_sub(sent));
+                                quality.record_rtt(&msg.from_key, rx.saturating_sub(sent));
                                 if let Some(rtt) = quality.rtt(&msg.from_key) {
                                     ep.set_link_latency(msg.from_key, rtt);
                                 }
@@ -1311,17 +1315,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                         }
                         ALLOW_PROBE_SEQ => {
                             if let Some(sent) = take_probe(&mut allow_sent, &msg.from_key, &echo.payload) {
-                                let sample = now.saturating_sub(sent);
-                                overlay.allow_rtt.insert(msg.from_key, (sample, now));
-                                finder.record_client(&msg.from_key, sample, now);
+                                let sample = rx.saturating_sub(sent);
+                                overlay.allow_rtt.insert(msg.from_key, (sample, rx));
+                                finder.record_client(&msg.from_key, sample, rx);
                             }
                         }
                         ROOT_PROBE_SEQ => {
                             if let Some((root, sent, nonce)) = root_probe {
                                 if root == msg.from_key && nonce.as_slice() == echo.payload.as_slice() {
-                                    let sample = now.saturating_sub(sent);
+                                    let sample = rx.saturating_sub(sent);
                                     quality.record_root_rtt(sample);
-                                    finder.record_root(sample, now);
+                                    finder.record_root(sample, rx);
                                     root_probe = None;
                                 }
                             }
@@ -1487,8 +1491,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             last_probe = Instant::now();
             for p in ep.connected_peers().into_iter().filter(|p| p.direction == Direction::Outbound) {
                 let nonce = new_nonce(&mut rng);
-                probe_sent.insert(p.key, (now, nonce));
                 let acts = ep.ping_key_payload(&p.key, QUALITY_ID, PEER_PROBE_SEQ, &nonce, now, &mut rng);
+                probe_sent.insert(p.key, (clock(start), nonce)); // stamped right before the write
                 run(acts, &mut ep, &mut streams, &mut dialer, now);
             }
         }
@@ -1498,8 +1502,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             let me = *ep.public_key();
             for k in allow_keys.iter().filter(|k| **k != me) {
                 let nonce = new_nonce(&mut rng);
-                allow_sent.insert(*k, (now, nonce));
                 let acts = ep.ping_payload(&addr_for_key(k), QUALITY_ID, ALLOW_PROBE_SEQ, &nonce, now, &mut rng);
+                allow_sent.insert(*k, (clock(start), nonce)); // stamped right before the write
                 run(acts, &mut ep, &mut streams, &mut dialer, now);
             }
         }
@@ -1554,8 +1558,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 if let Some(root) = overlay.root.filter(|r| *r != me) {
                     search_probe = Instant::now();
                     let nonce = new_nonce(&mut rng);
-                    root_probe = Some((root, now, nonce));
                     let acts = ep.ping_key_payload(&root, QUALITY_ID, ROOT_PROBE_SEQ, &nonce, now, &mut rng);
+                    root_probe = Some((root, clock(start), nonce));
                     run(acts, &mut ep, &mut streams, &mut dialer, now);
                 }
             }
@@ -1600,8 +1604,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 if let Some(root) = verdict.global_root {
                     if root != *ep.public_key() {
                         let nonce = new_nonce(&mut rng);
-                        root_probe = Some((root, now, nonce));
                         let acts = ep.ping_key_payload(&root, QUALITY_ID, ROOT_PROBE_SEQ, &nonce, now, &mut rng);
+                        root_probe = Some((root, clock(start), nonce));
                         run(acts, &mut ep, &mut streams, &mut dialer, now);
                     }
                 }
