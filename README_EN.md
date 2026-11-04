@@ -91,13 +91,23 @@ addresses:
    moves to the end of the queue. While the first round is running, dialing
    is held back (`set_dial_enabled(false)`), but at most for 60 s. The round
    repeats every 600 s.
-2. **Replacement by quality.** Every `--quality-interval` (and every 30 s
-   while the root is slow) the node measures RTT with echo requests: to every
-   connected peer and to the global root every 10 s, to `--allow` client
-   addresses every 10 s. If the RTT to the root is > **200 ms** or to an
-   allowed client is > **150 ms**, the slowest outgoing peer is disconnected
-   (at most once per 30 s) and replaced with the best candidate; the
-   disconnected peer is not re-dialed for 15 minutes.
+2. **Replacement by quality.** The node measures RTT with echo requests: to
+   every connected peer and to every `--allow` client address every 10 s, and
+   to the global root every `--quality-interval` (every 30 s while the root is
+   the slow metric). **Allowed keys have priority:** while at least one of
+   them has a fresh measurement, the worst smoothed RTT among them decides and
+   the root is ignored; the root decides only when no allowed key answers (a
+   silent client may just be offline, so it is not treated as slow). A value
+   counts after two samples (the first echo pays for path discovery) and
+   expires after 45 s. If the deciding RTT is above its limit (**150 ms**
+   for allowed clients, **200 ms** for the root), the outgoing peer with the
+   highest latency is disconnected and replaced with the best candidate; it
+   is not re-dialed for 15 minutes, and an allowed key that is connected
+   directly is never the one dropped. After 60 s the replacement is judged: if
+   the deciding RTT did not fall by at least 10%, the next replacement waits
+   twice as long (30 s, 60 s, ... up to 10 min), so a client that is simply
+   far away does not make the node churn through every public peer. The
+   decision logic lives in `src/search.rs` and is covered by unit tests.
 
 ### Node page on port 80 and API
 

@@ -46,17 +46,19 @@ Plain build (no TLS, no C libraries; depends only on `rand` and `heapless`):
 cargo build --release --bin tcp_node
 ```
 
-With TLS for yggdrasil-go LAN peers (uses the system OpenSSL through `native-tls`; on Termux
-install it first with `pkg install openssl`):
+With TLS for `tls://` peers and yggdrasil-go LAN peers (rustls with the `ring` provider: no
+OpenSSL and no system libraries, so nothing to install on Termux or for a router cross-build):
 
 ```sh
 cargo build --release --features upstream-tls --bin tcp_node
 ```
 
 The `upstream-tls` feature is off by default, so the `no_std` library build never pulls
-in TLS. The TLS build depends on the OpenSSL headers and library available at build time
-(`pkg install openssl` on Termux). Compare binary sizes with `ls -l target/release/tcp_node`
-for both builds.
+in TLS. The TLS build is roughly twice the size of the plain one (about 2.1 MB against
+1.0 MB on x86_64, 2.3 MB against 1.4 MB for mipsel); compare with `ls -l target/release/tcp_node`.
+Certificates are accepted unverified, as yggdrasil-go does: a peer's identity comes from the
+signed handshake that follows the TLS session. Dialing runs on worker threads, so a slow or
+unreachable peer no longer stalls the node.
 
 Tests:
 
@@ -209,9 +211,11 @@ cargo build --release --bin tcp_node --target aarch64-unknown-linux-musl
 scp target/aarch64-unknown-linux-musl/release/tcp_node root@192.168.1.1:/usr/bin/
 ```
 
-Install the service with `openwrt/tcp_node.init`. The TLS build (`--features
-upstream-tls`) needs OpenSSL built for the router's target, so cross-compiling it takes
-extra setup. The plain build needs none.
+Install the service with `openwrt/tcp_node.init`. The TLS build (`--features upstream-tls`)
+cross-compiles the same way; `ring` contains a little C, so point `cc` at the router toolchain,
+for example `CC_mipsel_unknown_linux_musl=.../mipsel-linux-muslsf-gcc`. For the mipsel
+musl targets, which have no prebuilt standard library, use nightly with
+`-Z build-std=std,panic_abort`.
 
 ### Library usage
 
@@ -250,7 +254,8 @@ YGGSTACK_BIN=/path/to/yggstack bash tests/e2e.sh
 
 - Verified: the library and `tcp_node` build on Termux; LAN connections to a yggdrasil-go
   peer work, and stay up while internet peers are connected. These results were obtained
-  with the earlier rustls-based TLS; the native-tls build has not been tested yet.
+  with an earlier rustls-based TLS. The current rustls build was tested against a local TLS
+  terminator (10 MiB through the tunnel); it has not been run against yggdrasil-go itself.
 - Open: a LAN-only connection (no internet peers) was reported to drop after 2–3 seconds.
   Cause not yet confirmed.
 - Not verified: TLS 1.2 negotiation with yggdrasil-go; the announce feature was removed.
@@ -303,16 +308,20 @@ Termux (Android), Linux и роутеров OpenWrt.
 cargo build --release --bin tcp_node
 ```
 
-С TLS для пиров yggdrasil-go в LAN (используется системный OpenSSL через `native-tls`; в Termux
-сначала установите его командой `pkg install openssl`):
+С TLS для пиров `tls://` и пиров yggdrasil-go в LAN (rustls с провайдером `ring`: без OpenSSL и
+системных библиотек, поэтому в Termux ничего устанавливать не нужно, а кросс-сборка под роутер
+проще):
 
 ```sh
 cargo build --release --features upstream-tls --bin tcp_node
 ```
 
 Feature `upstream-tls` выключена по умолчанию, поэтому сборка библиотеки `no_std` никогда
-не тянет TLS. Для сборки с TLS нужны заголовки и библиотека OpenSSL (в Termux: `pkg install
-openssl`). Размеры бинарников сравните командой `ls -l target/release/tcp_node` для обеих сборок.
+не тянет TLS. Сборка с TLS примерно вдвое больше обычной (около 2,1 МБ против 1,0 МБ на
+x86_64, 2,3 МБ против 1,4 МБ для mipsel); сравните командой `ls -l target/release/tcp_node`.
+Сертификаты принимаются без проверки, как в yggdrasil-go: личность пира подтверждает подписанное
+рукопожатие после TLS-сессии. Подключение выполняется в рабочих потоках, поэтому медленный или
+недоступный пир больше не останавливает узел.
 
 Тесты:
 
@@ -465,9 +474,10 @@ cargo build --release --bin tcp_node --target aarch64-unknown-linux-musl
 scp target/aarch64-unknown-linux-musl/release/tcp_node root@192.168.1.1:/usr/bin/
 ```
 
-Службу устанавливайте через `openwrt/tcp_node.init`. Сборка с TLS (`--features
-upstream-tls`) требует OpenSSL, собранный под архитектуру роутера, поэтому кросс-сборка
-потребует дополнительной настройки. Обычная сборка ничего не требует.
+Службу устанавливайте через `openwrt/tcp_node.init`. Сборка с TLS (`--features upstream-tls`)
+кросс-компилируется так же; `ring` содержит немного C, поэтому укажите `cc` компилятор
+роутера, например `CC_mipsel_unknown_linux_musl=.../mipsel-linux-muslsf-gcc`. Для целей mipsel
+musl без готовой стандартной библиотеки используйте nightly и `-Z build-std=std,panic_abort`.
 
 ### Использование библиотеки
 
@@ -506,7 +516,8 @@ YGGSTACK_BIN=/path/to/yggstack bash tests/e2e.sh
 
 - Проверено: библиотека и `tcp_node` собираются в Termux; LAN-соединения с пиром yggdrasil-go
   работают и держатся, пока подключены интернет-пиры. Эти результаты получены на прежней
-  TLS-реализации на rustls; сборка на native-tls ещё не проверялась.
+  TLS-реализации на rustls. Текущая сборка на rustls проверена с локальным TLS-терминатором
+  (10 МиБ через туннель); с самим yggdrasil-go она не запускалась.
 - Открыто: соединение только с LAN-пирами (без интернет-пиров) сообщалось как падающее через
   2–3 секунды. Причина пока не подтверждена.
 - Не проверено: согласование TLS 1.2 с yggdrasil-go. Режим анонса удалён из кода.
