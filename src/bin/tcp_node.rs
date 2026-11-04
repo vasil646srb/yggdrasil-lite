@@ -398,8 +398,8 @@ const BRIDGE_CHUNK: usize = 64 * 1024;
 const IDLE_WAIT_MS: u64 = 100;
 /// Wait cap while the candidate probe round runs: its workers report over a channel.
 const PROBE_WAIT_MS: u64 = 20;
-/// Wait cap with TLS peers, whose buffered bytes poll cannot see.
-const TLS_WAIT_MS: u64 = 10;
+/// Wait cap while dials run on worker threads.
+const DIAL_WAIT_MS: u64 = 20;
 
 /// Move bytes both ways for one bridge. Returns `false` if the local socket failed.
 fn pump_bridge(ep: &mut Endpoint, id: ConnId, b: &mut Bridge, buf: &mut [u8]) -> bool {
@@ -636,7 +636,7 @@ fn load_or_create_seed(path: &str) -> Result<[u8; 32], Box<dyn Error>> {
 enum Stream {
     Plain(TcpStream),
     #[cfg(feature = "upstream-tls")]
-    Tls(Box<native_tls::TlsStream<TcpStream>>),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
 }
 
 impl Read for Stream {
@@ -671,17 +671,19 @@ impl Stream {
         match self {
             Stream::Plain(s) => s.as_raw_fd(),
             #[cfg(feature = "upstream-tls")]
-            Stream::Tls(s) => s.get_ref().as_raw_fd(),
+            Stream::Tls(s) => s.sock.as_raw_fd(),
         }
     }
 
-    /// TLS keeps decrypted bytes in its own buffer, which the socket's readiness does not
-    /// show, so such streams are read on every pass.
-    fn buffers_reads(&self) -> bool {
+    /// TLS keeps decrypted bytes in its own buffer, which the socket's readiness does not show
+    /// (for example data that arrived together with the end of the handshake). Such a stream
+    /// must be read even though poll reports nothing.
+    fn has_buffered(&mut self) -> bool {
         match self {
             Stream::Plain(_) => false,
+            // On an error, report data so the next read surfaces it.
             #[cfg(feature = "upstream-tls")]
-            Stream::Tls(_) => true,
+            Stream::Tls(s) => s.conn.process_new_packets().map_or(true, |st| st.plaintext_bytes_to_read() > 0),
         }
     }
 
@@ -692,8 +694,9 @@ impl Stream {
             }
             #[cfg(feature = "upstream-tls")]
             Stream::Tls(s) => {
-                let _ = s.shutdown();
-                let _ = s.get_ref().shutdown(Shutdown::Both);
+                s.conn.send_close_notify();
+                let _ = s.conn.complete_io(&mut s.sock);
+                let _ = s.sock.shutdown(Shutdown::Both);
             }
         }
     }
@@ -779,45 +782,141 @@ fn dial_lan_tls(_addr: SocketAddr) -> Option<Stream> {
 #[cfg(feature = "upstream-tls")]
 mod upstream_tls {
     use super::Stream;
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::crypto::{ring, WebPkiSupportedAlgorithms};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme, StreamOwned};
     use std::error::Error;
     use std::net::{SocketAddr, TcpStream};
+    use std::sync::{Arc, OnceLock};
     use std::time::Duration;
 
-    /// Dial over TLS (system OpenSSL via native-tls). The certificate and hostname are not
-    /// checked, as yggdrasil-go does (InsecureSkipVerify); peer identity comes from the signed
-    /// meta-handshake that follows. TLS 1.2 is the minimum, TLS 1.3 is used when both sides support it.
+    /// Accepts any certificate, as yggdrasil-go does (InsecureSkipVerify): peer identity comes from
+    /// the signed meta-handshake that follows the TLS session, not from the certificate. The
+    /// handshake signatures are still checked, so the session itself is sound.
+    #[derive(Debug)]
+    struct AcceptAnyCert(WebPkiSupportedAlgorithms);
+
+    impl ServerCertVerifier for AcceptAnyCert {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0)
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0)
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.0.supported_schemes()
+        }
+    }
+
+    /// One shared client configuration: building it per dial would redo the provider setup.
+    fn client_config() -> Result<Arc<ClientConfig>, rustls::Error> {
+        static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+        if let Some(c) = CONFIG.get() {
+            return Ok(c.clone());
+        }
+        let provider = Arc::new(ring::default_provider());
+        let algs = provider.signature_verification_algorithms;
+        let cfg = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(algs)))
+            .with_no_client_auth();
+        Ok(CONFIG.get_or_init(|| Arc::new(cfg)).clone())
+    }
+
+    /// Dial over TLS (rustls). TLS 1.2 is the minimum and TLS 1.3 is used when both sides
+    /// support it. Runs on a dial worker thread: the connect and the handshake may take seconds.
     pub fn connect(addr: SocketAddr, name: &str) -> Result<Stream, Box<dyn Error>> {
         let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
         let _ = tcp.set_nodelay(true);
         let _ = tcp.set_write_timeout(Some(Duration::from_secs(5)));
         let _ = tcp.set_read_timeout(Some(Duration::from_secs(5)));
 
-        let connector = native_tls::TlsConnector::builder()
-            .danger_accept_invalid_certs(true)
-            .danger_accept_invalid_hostnames(true)
-            .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
-            .build()?;
-        // The name is used for SNI only: the certificate is not verified.
-        let tls = connector
-            .connect(name, tcp)
-            .map_err(|e| format!("TLS handshake: {e}"))?;
-        // Polled mode for the main loop: reads return after 1 ms when there is no data.
-        let _ = tls.get_ref().set_read_timeout(Some(Duration::from_millis(1)));
+        // The name is used for SNI only (and not even sent for an IP address): the certificate
+        // is not verified. A host name rustls rejects falls back to a fixed one.
+        let server_name = ServerName::try_from(name.to_owned())
+            .or_else(|_| ServerName::try_from("localhost".to_owned()))?;
+        let conn = ClientConnection::new(client_config()?, server_name)?;
+        let mut tls = StreamOwned::new(conn, tcp);
+        while tls.conn.is_handshaking() {
+            tls.conn.complete_io(&mut tls.sock).map_err(|e| format!("TLS handshake: {e}"))?;
+        }
+        // Polled mode for the main loop: a read returns after 1 ms when there is no data.
+        let _ = tls.sock.set_read_timeout(Some(Duration::from_millis(1)));
         Ok(Stream::Tls(Box::new(tls)))
     }
 }
 
-fn run(actions: Vec<Action>, ep: &mut Endpoint, streams: &mut HashMap<usize, Stream>, now: u64) {
+/// Outcome of a dial that ran on a worker thread.
+struct DialDone {
+    slot: usize,
+    /// Generation of the dial, to tell it from a later dial of the same slot.
+    gen: u64,
+    stream: Option<Stream>,
+}
+
+/// Runs dials on worker threads. A refused or silent peer, or a slow TLS handshake, used to freeze
+/// the whole node (every other peer and every forwarded connection) for up to ten seconds.
+struct Dialer {
+    tx: mpsc::Sender<DialDone>,
+    rx: mpsc::Receiver<DialDone>,
+    /// Slot -> generation of the dial in flight. A slot closed or re-dialed meanwhile drops the
+    /// old result.
+    inflight: HashMap<usize, u64>,
+    next_gen: u64,
+}
+
+impl Dialer {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self { tx, rx, inflight: HashMap::new(), next_gen: 0 }
+    }
+
+    fn start(&mut self, slot: usize, uri: TcpPeerUri) {
+        self.next_gen += 1;
+        let gen = self.next_gen;
+        self.inflight.insert(slot, gen);
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let stream = dial_slot(&uri);
+            let _ = tx.send(DialDone { slot, gen, stream });
+        });
+    }
+
+    fn cancel(&mut self, slot: usize) {
+        self.inflight.remove(&slot);
+    }
+}
+
+fn run(actions: Vec<Action>, ep: &mut Endpoint, streams: &mut HashMap<usize, Stream>, dialer: &mut Dialer, now: u64) {
     let mut queue: VecDeque<Action> = actions.into();
     while let Some(action) = queue.pop_front() {
         match action {
-            Action::Dial { slot, uri } => match dial_slot(&uri) {
-                Some(stream) => {
-                    streams.insert(slot, stream);
-                    queue.extend(ep.on_transport_up(slot, now));
-                }
-                None => ep.on_transport_failed(slot, now),
-            },
+            Action::Dial { slot, uri } => dialer.start(slot, uri),
             Action::Write { slot, data } => {
                 if let Some(s) = streams.get_mut(&slot) {
                     if let Err(e) = s.write_all(&data) {
@@ -828,6 +927,7 @@ fn run(actions: Vec<Action>, ep: &mut Endpoint, streams: &mut HashMap<usize, Str
                 }
             }
             Action::Close { slot } => {
+                dialer.cancel(slot);
                 if let Some(mut s) = streams.remove(&slot) {
                     s.shutdown();
                 }
@@ -1081,6 +1181,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut rng = OsRng;
     let mut streams: HashMap<usize, Stream> = HashMap::new();
+    let mut dialer = Dialer::new();
     let start = Instant::now();
     // Start the protocol clock away from zero, as the library tests do.
     let clock = |start: Instant| CLOCK_BASE + start.elapsed().as_millis() as u64;
@@ -1158,7 +1259,24 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mut activity = false;
         let now = clock(start);
         let actions = ep.poll(now, &mut rng);
-        run(actions, &mut ep, &mut streams, now);
+        run(actions, &mut ep, &mut streams, &mut dialer, now);
+
+        // Dials that finished on their worker threads.
+        while let Ok(done) = dialer.rx.try_recv() {
+            if dialer.inflight.get(&done.slot) != Some(&done.gen) {
+                continue; // the slot was closed or dialed again meanwhile: drop the stream
+            }
+            dialer.inflight.remove(&done.slot);
+            activity = true;
+            match done.stream {
+                Some(stream) => {
+                    streams.insert(done.slot, stream);
+                    let acts = ep.on_transport_up(done.slot, now);
+                    run(acts, &mut ep, &mut streams, &mut dialer, now);
+                }
+                None => ep.on_transport_failed(done.slot, now),
+            }
+        }
 
         // Public peer list from the background fetcher.
         if let Some(rx) = peer_rx.as_ref() {
@@ -1221,7 +1339,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let _ = stream.set_read_timeout(Some(Duration::from_millis(1)));
                 let (slot, acts) = ep.accept_transport(now);
                 streams.insert(slot, Stream::Plain(stream));
-                run(acts, &mut ep, &mut streams, now);
+                run(acts, &mut ep, &mut streams, &mut dialer, now);
                 println!("inbound from {from}");
             }
         }
@@ -1275,7 +1393,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         for slot in slots {
             // Only sockets poll reported (and TLS ones, see `buffers_reads`) are read, so idle
             // peers cost no system call and no 1 ms read timeout.
-            if !ready_slots.contains(&slot) && !streams.get(&slot).map_or(false, Stream::buffers_reads) {
+            if !ready_slots.contains(&slot) && !streams.get_mut(&slot).map_or(false, |s| s.has_buffered()) {
                 continue;
             }
             // Keep reading while the buffer comes back full: a busy link would
@@ -1297,7 +1415,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                     Ok(n) => {
                         let actions = ep.on_bytes(slot, &peer_buf[..n], now, &mut rng);
-                        run(actions, &mut ep, &mut streams, now);
+                        run(actions, &mut ep, &mut streams, &mut dialer, now);
                         if n < peer_buf.len() {
                             break;
                         }
@@ -1385,7 +1503,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 ping_seq = ping_seq.wrapping_add(1);
                 ping_sent.insert(ping_seq, Instant::now());
                 let actions = ep.ping(&Address(dest.octets()), 0x7947, ping_seq, clock(start), &mut rng);
-                run(actions, &mut ep, &mut streams, clock(start));
+                run(actions, &mut ep, &mut streams, &mut dialer, clock(start));
             }
         }
 
@@ -1395,7 +1513,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let our = ep.address().0;
                 let pkt = udp::build(our, dest.octets(), 40000, *dport, text.as_bytes());
                 let acts = ep.send_to_address(&Address(dest.octets()), &frame_ipv6(&pkt), clock(start), &mut rng);
-                run(acts, &mut ep, &mut streams, clock(start));
+                run(acts, &mut ep, &mut streams, &mut dialer, clock(start));
             }
         }
 
@@ -1403,7 +1521,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             if last_send.elapsed() >= Duration::from_secs(10) {
                 last_send = Instant::now();
                 let actions = ep.send_to_address(&Address(dest.octets()), text.as_bytes(), clock(start), &mut rng);
-                run(actions, &mut ep, &mut streams, clock(start));
+                run(actions, &mut ep, &mut streams, &mut dialer, clock(start));
             }
         }
 
@@ -1503,7 +1621,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             for (client, overlay, client_port, payload) in replies {
                 let pkt = udp::build(our, client, overlay, client_port, &payload);
                 let acts = ep.send_to_address(&Address(client), &frame_ipv6(&pkt), now, &mut rng);
-                run(acts, &mut ep, &mut streams, now);
+                run(acts, &mut ep, &mut streams, &mut dialer, now);
             }
         }
 
@@ -1513,7 +1631,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let nonce = new_nonce(&mut rng);
                 probe_sent.insert(p.key, (now, nonce));
                 let acts = ep.ping_key_payload(&p.key, QUALITY_ID, PEER_PROBE_SEQ, &nonce, now, &mut rng);
-                run(acts, &mut ep, &mut streams, now);
+                run(acts, &mut ep, &mut streams, &mut dialer, now);
             }
         }
 
@@ -1524,7 +1642,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let nonce = new_nonce(&mut rng);
                 allow_sent.insert(*k, (now, nonce));
                 let acts = ep.ping_payload(&addr_for_key(k), QUALITY_ID, ALLOW_PROBE_SEQ, &nonce, now, &mut rng);
-                run(acts, &mut ep, &mut streams, now);
+                run(acts, &mut ep, &mut streams, &mut dialer, now);
             }
         }
 
@@ -1568,7 +1686,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 println!("{msg}");
                 push_swap(&mut overlay, msg);
                 let acts = ep.drop_peer(&d.drop, now, SLOW_PEER_COOLDOWN_MS);
-                run(acts, &mut ep, &mut streams, now);
+                run(acts, &mut ep, &mut streams, &mut dialer, now);
                 quality.forget(&d.drop);
                 quality.clear_root_rtt();
                 overlay.allow_rtt.clear();
@@ -1580,7 +1698,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     let nonce = new_nonce(&mut rng);
                     root_probe = Some((root, now, nonce));
                     let acts = ep.ping_key_payload(&root, QUALITY_ID, ROOT_PROBE_SEQ, &nonce, now, &mut rng);
-                    run(acts, &mut ep, &mut streams, now);
+                    run(acts, &mut ep, &mut streams, &mut dialer, now);
                 }
             }
         }
@@ -1618,7 +1736,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 for k in &verdict.foreign {
                     println!("  drop {} (other root)", short_key(k));
                     let acts = ep.drop_peer(k, now, FOREIGN_COOLDOWN_MS);
-                    run(acts, &mut ep, &mut streams, now);
+                    run(acts, &mut ep, &mut streams, &mut dialer, now);
                     quality.forget(k);
                 }
                 if let Some(root) = verdict.global_root {
@@ -1626,7 +1744,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         let nonce = new_nonce(&mut rng);
                         root_probe = Some((root, now, nonce));
                         let acts = ep.ping_key_payload(&root, QUALITY_ID, ROOT_PROBE_SEQ, &nonce, now, &mut rng);
-                        run(acts, &mut ep, &mut streams, now);
+                        run(acts, &mut ep, &mut streams, &mut dialer, now);
                     }
                 }
             }
@@ -1641,6 +1759,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         // wait at once (so echo replies are timed when they arrive, not on the next tick), and
         // otherwise the earliest timer decides. The cap covers the periodic jobs above and the
         // worker threads, which report over channels that poll cannot see.
+        // Decrypted TLS data that poll cannot see (it arrived with the end of the handshake, or
+        // the read buffer filled up) is handled on the next pass.
+        if streams.values_mut().any(|s| s.has_buffered()) {
+            activity = true;
+        }
         let wait_ms = if prev_ready || activity {
             0
         } else {
@@ -1652,8 +1775,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             if first_round || probe_pending > 0 {
                 w = w.min(PROBE_WAIT_MS);
             }
-            if streams.values().any(Stream::buffers_reads) {
-                w = w.min(TLS_WAIT_MS);
+            if !dialer.inflight.is_empty() {
+                w = w.min(DIAL_WAIT_MS); // dial workers report over a channel
             }
             w
         };
