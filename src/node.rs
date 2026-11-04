@@ -1034,7 +1034,7 @@ impl YggdrasilLite {
     /// discovery — and with it the no_redistribute policy of transit nodes.
     fn route_to_dest(&mut self, dest: &PublicKey, payload: Vec<u8>) -> Option<NodeEvent> {
         // Get destination coordinates from pathfinder
-        let dest_path = match self.pathfinder.get_path(dest) {
+        let dest_path = match self.pathfinder.get_path_for_traffic(dest) {
             Some(p) => p.to_vec(),
             None => {
                 // Keep only the newest payload per destination (pre-session

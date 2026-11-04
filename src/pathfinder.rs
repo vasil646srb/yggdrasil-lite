@@ -145,6 +145,13 @@ impl LeafPathfinder {
             .map(|(_, e)| e.path.as_slice())
     }
 
+    /// Get the cached path for a destination even if it is marked broken.
+    /// Traffic keeps using it while a new lookup runs, as ironwood does: a
+    /// broken flag only means a fresh PathNotify is wanted.
+    pub fn get_path_for_traffic(&self, dest: &PublicKey) -> Option<&[PeerPort]> {
+        self.paths.iter().find(|(k, _)| k == dest).map(|(_, e)| e.path.as_slice())
+    }
+
     /// Update or insert a path from an incoming traffic frame's `from` field.
     /// This allows the lite node to learn return paths without a full PathNotify exchange.
     pub fn update_path(&mut self, source: PublicKey, path: Vec<PeerPort>, now_ms: u64) {
