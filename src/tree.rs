@@ -158,7 +158,15 @@ pub struct LeafTree {
     sent_to: Vec<(PublicKey, Vec<PublicKey>)>,
 
     /// Flags for parent selection state machine.
+    ///
+    /// `needs_refresh` means "re-sign our announcement even if the parent is unchanged": the
+    /// periodic refresh, a peer change, or a newer announcement about ourselves. It stays
+    /// set until a refresh actually happened.
     needs_refresh: bool,
+    /// New input (a SigRes or an announcement) arrived, so parent selection may now find
+    /// something to adopt. Only asks for a maintenance pass; it must never imply a
+    /// refresh, or every answer to a SigReq would start the next SigReq cycle.
+    dirty: bool,
     do_root1: bool,
     do_root2: bool,
 }
@@ -174,6 +182,7 @@ impl LeafTree {
             responses: Vec::new(),
             sent_to: Vec::new(),
             needs_refresh: false,
+            dirty: false,
             do_root1: false,
             do_root2: true, // become root on first maintenance
         }
@@ -295,11 +304,14 @@ impl LeafTree {
             port: res.port,
             psig: res.psig,
         });
-        // A new response lets us (re)evaluate parent selection. Flag a refresh
-        // so the next maintenance pass runs promptly instead of waiting for the
-        // periodic tick — this is what lets a freshly connected leaf adopt a
-        // parent and obtain coordinates within a poll cycle rather than ~30s.
-        self.needs_refresh = true;
+        // A new response lets us (re)evaluate parent selection. Ask for a maintenance
+        // pass so the next poll runs it promptly instead of waiting for the periodic
+        // tick — this is what lets a freshly connected leaf adopt a parent and obtain
+        // coordinates within a poll cycle rather than ~30s. This is not a refresh:
+        // `fix` adopts a new parent on its own (the parent differs from the current
+        // one), and re-signing the same parent on every answer made two linked nodes
+        // exchange SigReq/SigRes/announcements without end.
+        self.dirty = true;
     }
 
     // -----------------------------------------------------------------------
@@ -377,6 +389,9 @@ impl LeafTree {
         );
 
         if accepted {
+            // A SigRes may have been waiting for this announcement (parent selection skips
+            // peers whose tree info is unknown), and our own coordinates may have changed.
+            self.dirty = true;
             // Mark as received from this peer
             self.mark_sent(peer_key, &ann.key);
 
@@ -747,6 +762,7 @@ impl LeafTree {
         nonce: u64,
     ) -> Vec<TreeAction> {
         let mut actions = Vec::new();
+        self.dirty = false;
         self.do_root2 = self.do_root2 || self.do_root1;
         actions.extend(self.fix(crypto, peers, nonce));
         actions.extend(self.send_announces(peers));
@@ -759,10 +775,10 @@ impl LeafTree {
     }
 
     /// Whether the tree wants a maintenance pass before the next periodic tick
-    /// (e.g. a peer was just added or a new SigRes arrived). Lets the caller's
-    /// `poll` converge promptly instead of waiting for the tree interval.
+    /// (e.g. a peer was just added, or a new SigRes or announcement arrived). Lets
+    /// the caller's `poll` converge promptly instead of waiting for the tree interval.
     pub fn needs_refresh(&self) -> bool {
-        self.needs_refresh
+        self.needs_refresh || self.dirty
     }
 }
 
@@ -824,6 +840,141 @@ mod tests {
         assert!(tree.update_info(crypto.public_key, crypto.public_key, 2, nonce, 0, sig, sig));
 
         assert_eq!(tree.get_info(&crypto.public_key).unwrap().seq, 2);
+    }
+
+    /// Message in flight between the two trees of `linked_pair_*` tests.
+    enum Msg {
+        Req(wire::SigReq),
+        Res(wire::SigRes),
+        Ann(wire::Announce),
+    }
+
+    /// Two leaves linked to each other, driven only by the messages they produce.
+    struct Pair {
+        ca: Crypto,
+        cb: Crypto,
+        ta: LeafTree,
+        tb: LeafTree,
+        /// (destination is A, message)
+        q: alloc::collections::VecDeque<(bool, Msg)>,
+        /// SigReqs sent so far, by both sides.
+        reqs: usize,
+        first: bool,
+    }
+
+    impl Pair {
+        fn new() -> Self {
+            let (ca, cb) = (make_crypto(), make_crypto());
+            let (ka, kb) = (ca.public_key, cb.public_key);
+            let (mut ta, mut tb) = (LeafTree::new(ka), LeafTree::new(kb));
+            // What YggdrasilLite::add_peer does.
+            ta.add_peer(kb);
+            ta.set_needs_refresh();
+            tb.add_peer(ka);
+            tb.set_needs_refresh();
+            Self { ca, cb, ta, tb, q: Default::default(), reqs: 0, first: true }
+        }
+
+        fn queue(&mut self, actions: Vec<TreeAction>, to_a: bool) {
+            for a in actions {
+                match a {
+                    TreeAction::SendSigReq { req, .. } => {
+                        self.reqs += 1;
+                        self.q.push_back((to_a, Msg::Req(req)));
+                    }
+                    TreeAction::SendSigRes { res, .. } => self.q.push_back((to_a, Msg::Res(res))),
+                    TreeAction::SendAnnounce { ann, .. } => self.q.push_back((to_a, Msg::Ann(ann))),
+                }
+            }
+        }
+
+        /// One round: deliver everything in flight, then run the maintenance pass each side's
+        /// `YggdrasilLite::poll` would run (first poll, or when the tree asks for one).
+        fn round(&mut self) {
+            let (ka, kb) = (self.ca.public_key, self.cb.public_key);
+            while let Some((to_a, msg)) = self.q.pop_front() {
+                let out = if to_a {
+                    match msg {
+                        Msg::Req(r) => alloc::vec![self.ta.handle_sig_req(&self.ca, 1, &kb, 1, &r)],
+                        Msg::Res(r) => {
+                            self.ta.handle_sig_res(kb, &r);
+                            Vec::new()
+                        }
+                        Msg::Ann(a) => self.ta.handle_announce(1, &kb, &a),
+                    }
+                } else {
+                    match msg {
+                        Msg::Req(r) => alloc::vec![self.tb.handle_sig_req(&self.cb, 1, &ka, 1, &r)],
+                        Msg::Res(r) => {
+                            self.tb.handle_sig_res(ka, &r);
+                            Vec::new()
+                        }
+                        Msg::Ann(a) => self.tb.handle_announce(1, &ka, &a),
+                    }
+                };
+                // Replies and corrections go back to the sender.
+                self.queue(out, !to_a);
+            }
+            if self.first || self.ta.needs_refresh() {
+                let acts = self.ta.do_maintenance(&self.ca, &[(1, kb, 10)], random_nonce());
+                self.queue(acts, false);
+            }
+            if self.first || self.tb.needs_refresh() {
+                let acts = self.tb.do_maintenance(&self.cb, &[(1, ka, 10)], random_nonce());
+                self.queue(acts, true);
+            }
+            self.first = false;
+        }
+    }
+
+    /// Every SigRes used to flag a refresh, which `fix` reads as "re-sign the parent even if it
+    /// did not change". The child re-adopted its parent and sent a new SigReq, the answer flagged
+    /// the next refresh, and the root re-rooted on every answer too: a linked pair exchanged
+    /// SigReq, SigRes and announcements forever, as fast as the link allowed.
+    #[test]
+    fn linked_pair_settles_instead_of_exchanging_requests_forever() {
+        let mut p = Pair::new();
+        for _ in 0..300 {
+            p.round();
+        }
+        assert!(p.reqs < 20, "{} SigReqs in 300 rounds: the pair never settled", p.reqs);
+
+        // Converged: both see the lower key as root, the other one hangs below it.
+        let (ka, kb) = (p.ca.public_key, p.cb.public_key);
+        let root = ka.min(kb);
+        assert_eq!(p.ta.get_root(), root);
+        assert_eq!(p.tb.get_root(), root);
+        if root == ka {
+            assert_eq!(p.tb.get_parent(), Some(ka));
+            assert_eq!(p.ta.get_parent(), Some(ka));
+        } else {
+            assert_eq!(p.ta.get_parent(), Some(kb));
+            assert_eq!(p.tb.get_parent(), Some(kb));
+        }
+    }
+
+    /// The periodic refresh (`set_needs_refresh` from the timer) must still re-sign the tree
+    /// once, and then go quiet again.
+    #[test]
+    fn linked_pair_periodic_refresh_resigns_once_then_settles() {
+        let mut p = Pair::new();
+        for _ in 0..300 {
+            p.round();
+        }
+        let (ka, kb) = (p.ca.public_key, p.cb.public_key);
+        let seqs = |p: &Pair| (p.ta.get_info(&ka).unwrap().seq, p.tb.get_info(&kb).unwrap().seq);
+        let (sa, sb) = seqs(&p);
+        let reqs = p.reqs;
+
+        p.ta.set_needs_refresh();
+        p.tb.set_needs_refresh();
+        for _ in 0..300 {
+            p.round();
+        }
+        let (sa2, sb2) = seqs(&p);
+        assert!(sa2 > sa && sb2 > sb, "refresh re-signed neither side: {sa}->{sa2}, {sb}->{sb2}");
+        assert!(p.reqs - reqs < 20, "{} SigReqs for one refresh: not settling", p.reqs - reqs);
+        assert_eq!(p.ta.get_root(), p.tb.get_root());
     }
 
     #[test]
