@@ -24,7 +24,8 @@ ALLOW="9bf37423777fab63d13b6c125dd0cdb5f2c1d5fe850fa7316fd79fdb6de1ddc6"
 # Overlay ports to forward to the router's local ports: "22" or "2222:22,8080".
 # Only allowed keys can connect. Example: SSH on the router's port 22.
 FORWARD="22"
-# Local status API, e.g. 127.0.0.1:8080 (empty = off). Open http://127.0.0.1:8080/
+# Local status API, e.g. 127.0.0.1:8080 (empty = the build's default). Needs a tcp_node built
+# with --features html, which serves it on 127.0.0.1:1080 by default; the plain build refuses --api.
 API=""
 # Seconds between root checks (>= 10).
 QUALITY_INTERVAL=300
