@@ -119,9 +119,9 @@ addresses:
    the slow metric). **Allowed keys have priority:** while at least one of
    them has a fresh measurement, the worst smoothed RTT among them decides and
    the root is ignored; the root decides only when no allowed key answers (a
-   silent client may just be offline, so it is not treated as slow). A value
-   counts after two samples (the first echo pays for path discovery) and
-   expires after 45 s. If the deciding RTT is above its limit (**150 ms**
+   silent client may just be offline, so it is not treated as slow). The first echo of a run
+   is thrown away (it pays for path discovery and the session handshake and
+   can take seconds), a value counts after a second one, and it expires after 45 s. If the deciding RTT is above its limit (**150 ms**
    for allowed clients, **200 ms** for the root), the outgoing peer with the
    highest latency is disconnected and replaced with the best candidate; it
    is not re-dialed for 15 minutes, and an allowed key that is connected
@@ -129,7 +129,8 @@ addresses:
    the deciding RTT did not fall by at least 10%, the next replacement waits
    twice as long (30 s, 60 s, ... up to 10 min), so a client that is simply
    far away does not make the node churn through every public peer. The
-   decision logic lives in `src/search.rs` and is covered by unit tests.
+   decision logic lives in `src/search.rs` (unit tests); `tests/peer_search.sh` runs it
+   end to end on loopback with a delayed link (helpful and unhelpful replacement).
 
 ### Node page on port 1080 and API (`html` build)
 
