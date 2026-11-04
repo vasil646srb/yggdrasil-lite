@@ -57,15 +57,16 @@ pub mod peerlist;
 pub mod icmp;
 pub mod udp;
 pub mod tcp;
+pub mod tcp_stack;
+pub mod http;
 pub mod quality;
-pub mod forward;
 
 // Re-export the main public types for convenience.
 pub use node::{YggdrasilLite, LiteConfig, NodeEvent};
 pub use crypto::PublicKey;
 pub use peer::PeerId;
 pub use wire::PeerPort;
-pub use forward::Event as ForwardEvent;
+pub use tcp_stack::{CloseReason, ConnId, ConnInfo, Event as TcpEvent, TcpConfig, TcpStack};
 pub use endpoint::{frame_ipv6, unframe_ipv6, Action, Direction, Endpoint, PeerInfo, Received, IPV6_FRAME};
 pub use pool::CandidateSource;
 pub use uri::{TcpPeerUri, UriError};

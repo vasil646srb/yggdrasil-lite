@@ -27,11 +27,13 @@ use alloc::vec::Vec;
 
 use ed25519_dalek::SigningKey;
 use rand_core::CryptoRngCore;
+use sha2::{Digest, Sha256};
 
 use crate::address::{self, Address};
-use crate::forward::{self, Forward};
+use crate::http::HttpServer;
 use crate::icmp::{self, ECHO_REPLY, ECHO_REQUEST};
-use crate::tcp::{self, HttpServer};
+use crate::tcp;
+use crate::tcp_stack::{self, ConnId, ConnInfo, TcpConfig, TcpStack};
 use crate::crypto::PublicKey;
 use crate::meta::{MetaError, Metadata};
 use crate::node::{LiteConfig, NodeEvent, YggdrasilLite};
@@ -132,13 +134,21 @@ pub struct Endpoint {
     allowed: Vec<PublicKey>,
     /// Answer ICMPv6 echo requests from allowed keys (default on).
     ping_replies: bool,
+    /// Accept `tls://` candidates (the platform can dial TLS). Default off.
+    tls_peers: bool,
     /// Echo replies waiting to be sent: (destination key, IPv6 packet).
     outbox: VecDeque<(PublicKey, Vec<u8>)>,
-    /// Optional static page served on TCP port 80.
+    /// TCP over the overlay: connections for the application and the HTTP page.
+    tcp: TcpStack,
+    /// Ports the application listens on (its connections are reported through `tcp_event`).
+    tcp_ports: Vec<u16>,
+    /// TCP events for the application.
+    tcp_events: VecDeque<tcp_stack::Event>,
+    /// TCP packets waiting to be sent: (destination address, framed IPv6 packet).
+    tcp_out: VecDeque<([u8; 16], Vec<u8>)>,
+    /// Optional page served on TCP port 80.
     http: Option<HttpServer>,
-    /// TCP port forwarding for the overlay ports given at startup.
-    forward: Option<Forward>,
-    /// Time of the last `poll`/`on_bytes` call, used to stamp forwarded segments.
+    /// Time of the last `poll`/`on_bytes` call, used to stamp TCP segments.
     last_now_ms: u64,
 }
 
@@ -199,6 +209,11 @@ impl Endpoint {
         cfg.password = password.clone();
         let node = YggdrasilLite::new(cfg);
         let public = *node.public_key();
+        let mut h = Sha256::new();
+        h.update(b"yggdrasil-lite tcp isn");
+        h.update(private_key);
+        let secret: [u8; 32] = h.finalize().into();
+        let tcp = TcpStack::new(node.address().0, secret, TcpConfig::default());
         Self {
             signing,
             public,
@@ -210,20 +225,27 @@ impl Endpoint {
             pending: VecDeque::new(),
             allowed: Vec::new(),
             ping_replies: true,
+            tls_peers: false,
             outbox: VecDeque::new(),
+            tcp,
+            tcp_ports: Vec::new(),
+            tcp_events: VecDeque::new(),
+            tcp_out: VecDeque::new(),
             http: None,
-            forward: None,
             last_now_ms: 0,
         }
     }
 
     /// Serve `page` as HTML on TCP port 80 to allowed keys. Requires a
     /// client that speaks TCP over Yggdrasil (for example yggstack's SOCKS proxy).
+    /// If the application listens on port 80 itself ([`tcp_listen`](Self::tcp_listen)),
+    /// its listener wins and the page is not served.
     pub fn serve_http(&mut self, page: Vec<u8>) {
         match self.http.as_mut() {
             Some(srv) => srv.set_page(page),
             None => self.http = Some(HttpServer::new(page)),
         }
+        self.tcp.listen(tcp::HTTP_PORT);
     }
 
     /// Enable or disable automatic replies to ICMPv6 echo requests.
@@ -280,50 +302,87 @@ impl Endpoint {
         self.node.set_link_latency(key, rtt_ms);
     }
 
-    /// Accept TCP connections on these overlay ports from allowed keys, and report
-    /// them through [`forward_event`](Self::forward_event). An empty list turns forwarding off.
-    pub fn set_forward_ports(&mut self, ports: &[u16]) {
-        self.forward = if ports.is_empty() {
-            None
-        } else {
-            Some(Forward::new(self.node.address().0, ports))
-        };
-    }
+    // -----------------------------------------------------------------------
+    // TCP
+    // -----------------------------------------------------------------------
 
-    /// Next forwarding event for the platform (open, data, remote close, closed).
-    pub fn forward_event(&mut self) -> Option<forward::Event> {
-        self.forward.as_mut()?.pop_event()
-    }
-
-    /// Send `data` to the remote client of session `id`. Returns `false` if nothing
-    /// was queued (unknown session or full queue, see [`forward::SEND_QUEUE_MAX`]).
-    pub fn forward_write(&mut self, id: forward::SessionId, data: &[u8]) -> bool {
-        let now = self.last_now_ms;
-        let ok = self.forward.as_mut().map_or(false, |f| f.write(id, data, now));
-        self.flush_forward();
-        ok
-    }
-
-    /// Bytes queued for the remote client of session `id`, waiting to be sent.
-    pub fn forward_queued(&self, id: forward::SessionId) -> usize {
-        self.forward.as_ref().map_or(0, |f| f.queued(id))
-    }
-
-    /// The local side is done sending: FIN after the queued bytes.
-    pub fn forward_close(&mut self, id: forward::SessionId) {
-        let now = self.last_now_ms;
-        if let Some(f) = self.forward.as_mut() {
-            f.close(id, now);
+    /// Accept TCP connections from allowed keys on overlay `port`. New
+    /// connections are reported as [`tcp_stack::Event::Accepted`] by
+    /// [`tcp_event`](Self::tcp_event).
+    pub fn tcp_listen(&mut self, port: u16) {
+        if !self.tcp_ports.contains(&port) {
+            self.tcp_ports.push(port);
         }
-        self.flush_forward();
+        self.tcp.listen(port);
     }
 
-    /// The local side failed: reset the session towards the remote client.
-    pub fn forward_abort(&mut self, id: forward::SessionId) {
-        if let Some(f) = self.forward.as_mut() {
-            f.reset(id);
+    /// Stop accepting connections on `port` (open ones stay).
+    pub fn tcp_unlisten(&mut self, port: u16) {
+        self.tcp_ports.retain(|p| *p != port);
+        if !(port == tcp::HTTP_PORT && self.http.is_some()) {
+            self.tcp.unlisten(port);
         }
-        self.flush_forward();
+    }
+
+    /// Open a TCP connection to `dest`:`port`. The connection is reported as
+    /// [`tcp_stack::Event::Connected`] once established, or `Closed` if it fails.
+    /// The remote node does not have to be in the allowed list: replies on a
+    /// connection we opened are accepted.
+    pub fn tcp_connect(&mut self, dest: &Address, port: u16) -> Option<ConnId> {
+        let id = self.tcp.connect(dest.0, port, self.last_now_ms);
+        self.after_tcp();
+        id
+    }
+
+    /// Next TCP event for the application.
+    pub fn tcp_event(&mut self) -> Option<tcp_stack::Event> {
+        self.tcp_events.pop_front()
+    }
+
+    /// Read received bytes. Returns 0 when nothing is buffered.
+    pub fn tcp_read(&mut self, id: ConnId, buf: &mut [u8]) -> usize {
+        let n = self.tcp.read(id, buf);
+        self.after_tcp();
+        n
+    }
+
+    /// Queue bytes for sending; returns how many were accepted (see [`TcpStack::write`]).
+    pub fn tcp_write(&mut self, id: ConnId, data: &[u8]) -> usize {
+        let n = self.tcp.write(id, data);
+        self.after_tcp();
+        n
+    }
+
+    /// Free space in the send buffer of `id`.
+    pub fn tcp_send_space(&self, id: ConnId) -> usize {
+        self.tcp.send_space(id)
+    }
+
+    /// Bytes written to `id` and not yet acknowledged by the peer.
+    pub fn tcp_send_queued(&self, id: ConnId) -> usize {
+        self.tcp.send_queued(id)
+    }
+
+    /// Graceful close of the sending side (FIN after queued data).
+    pub fn tcp_close(&mut self, id: ConnId) {
+        self.tcp.close(id);
+        self.after_tcp();
+    }
+
+    /// Reset the connection.
+    pub fn tcp_abort(&mut self, id: ConnId) {
+        self.tcp.abort(id);
+        self.after_tcp();
+    }
+
+    /// Remote address and port of a connection.
+    pub fn tcp_remote(&self, id: ConnId) -> Option<(Address, u16)> {
+        self.tcp.remote(id).map(|(a, p)| (Address(a), p))
+    }
+
+    /// Statistics of all open TCP connections (the HTTP page's included).
+    pub fn tcp_connections(&self) -> Vec<ConnInfo> {
+        self.tcp.connections()
     }
 
     /// Send an echo request to the Yggdrasil address of `key` (a peer or the root).
@@ -395,12 +454,22 @@ impl Endpoint {
         self.node.address()
     }
 
-    /// Add a peer candidate. Only `tcp://host:port` is accepted. Returns
+    /// Add a peer candidate: `tcp://host:port`, or `tls://` after
+    /// [`set_tls_peers`](Self::set_tls_peers). Returns
     /// `Ok(true)` if it is new. Candidates are dialed automatically, best
     /// measured latency first.
     pub fn add_peer_uri(&mut self, uri: &str, source: CandidateSource) -> Result<bool, UriError> {
         let parsed = TcpPeerUri::parse(uri)?;
+        if parsed.is_tls() && !self.tls_peers {
+            return Err(UriError::UnsupportedScheme);
+        }
         Ok(self.pool.add_candidate(parsed, source))
+    }
+
+    /// Accept `tls://` candidates. Enable only when the platform wraps those
+    /// connections in TLS; otherwise they are skipped on import.
+    pub fn set_tls_peers(&mut self, on: bool) {
+        self.tls_peers = on;
     }
 
     /// Import the usable TCP peers from a public peer list document (JSON bytes
@@ -411,6 +480,9 @@ impl Endpoint {
     pub fn import_peer_list(&mut self, json: &[u8], source: CandidateSource) -> usize {
         let mut added = 0;
         for entry in crate::peerlist::tcp_peers_from_json(json) {
+            if entry.uri.is_tls() && !self.tls_peers {
+                continue;
+            }
             let uri = match entry.key {
                 Some(k) => entry.uri.with_key(k),
                 None => entry.uri,
@@ -502,10 +574,8 @@ impl Endpoint {
     pub fn poll(&mut self, now_ms: u64, rng: &mut impl CryptoRngCore) -> Vec<Action> {
         self.last_now_ms = now_ms;
         let mut actions = Vec::new();
-        if let Some(f) = self.forward.as_mut() {
-            f.poll(now_ms);
-        }
-        self.flush_forward();
+        self.tcp.poll(now_ms);
+        self.after_tcp();
 
         // Dials that stalled past the timeout.
         for slot in self.pool.expire(now_ms) {
@@ -543,6 +613,14 @@ impl Endpoint {
         // Echo replies queued while delivering.
         while let Some((key, pkt)) = self.outbox.pop_front() {
             actions.extend(self.send_to_key(&key, &pkt, now_ms, rng));
+        }
+
+        // TCP segments: straight to the key when known, otherwise after a lookup.
+        while let Some((dest, pkt)) = self.tcp_out.pop_front() {
+            match self.node.resolve(&dest) {
+                Some(key) => actions.extend(self.send_to_key(&key, &pkt, now_ms, rng)),
+                None => actions.extend(self.send_to_address(&Address(dest), &pkt, now_ms, rng)),
+            }
         }
 
         actions
@@ -727,28 +805,51 @@ impl Endpoint {
 
     /// Forget a connection and tell the pool. No I/O: the platform already
     /// knows the socket is gone.
-    /// Pass a TCP segment for a forwarded port to the forwarder. Returns `false`
-    /// if the packet is not such a segment.
-    fn forward_handle(&mut self, source: PublicKey, ip: &[u8]) -> bool {
-        let now = self.last_now_ms;
-        let our = self.node.address().0;
-        let Some(fwd) = self.forward.as_mut() else { return false };
-        let Some(seg) = tcp::parse(ip) else { return false };
-        if seg.dst != our || !fwd.wants(seg.dport) {
-            return false;
-        }
-        fwd.handle_segment(source, &seg, now);
-        self.flush_forward();
-        true
-    }
-
-    /// Queue the forwarder's packets for sending.
-    fn flush_forward(&mut self) {
-        if let Some(f) = self.forward.as_mut() {
-            for (key, pkt) in f.drain_out() {
-                self.outbox.push_back((key, frame_ipv6(&pkt)));
+    /// Route TCP events (HTTP page or application), run the HTTP server and
+    /// queue the stack's packets.
+    fn after_tcp(&mut self) {
+        for _ in 0..16 {
+            while let Some(ev) = self.tcp.pop_event() {
+                let http_port_ours = !self.tcp_ports.contains(&tcp::HTTP_PORT);
+                let to_http = match (&ev, self.http.as_mut()) {
+                    (tcp_stack::Event::Accepted { id, port }, Some(h)) if *port == tcp::HTTP_PORT && http_port_ours => {
+                        h.accept(*id);
+                        true
+                    }
+                    (ev, Some(h)) if h.owns(ev.id()) => {
+                        h.on_event(ev);
+                        true
+                    }
+                    _ => false,
+                };
+                if !to_http {
+                    self.tcp_events.push_back(ev);
+                }
+            }
+            if let Some(h) = self.http.as_mut() {
+                h.pump(&mut self.tcp);
+            }
+            if !self.tcp.has_events() {
+                break;
             }
         }
+        for (dest, pkt) in self.tcp.drain_out() {
+            self.tcp_out.push_back((dest, frame_ipv6(&pkt)));
+        }
+    }
+
+    /// Hand a TCP segment addressed to us to the stack. It must come from the
+    /// key that owns its source address, and either from an allowed key or on
+    /// a connection we opened.
+    fn tcp_input(&mut self, source: &PublicKey, seg: &tcp::Segment) {
+        if seg.src != address::addr_for_key(source).0 {
+            return;
+        }
+        if !self.allowed.contains(source) && !self.tcp.has_connection(seg) {
+            return;
+        }
+        self.tcp.handle_segment(seg, self.last_now_ms);
+        self.after_tcp();
     }
 
     fn is_echo_reply_to_us(&self, data: &[u8]) -> bool {
@@ -783,26 +884,19 @@ impl Endpoint {
                     }
                 }
                 NodeEvent::Deliver { source, data } => {
+                    let our = self.node.address().0;
+                    let ip = unframe_ipv6(&data);
+                    // TCP to our address goes to the stack (which checks keys itself).
+                    if let Some(seg) = tcp::parse(ip) {
+                        if seg.dst == our {
+                            self.tcp_input(&source, &seg);
+                            continue;
+                        }
+                    }
                     // Echo replies are accepted from any peer: they can only answer
                     // our own `ping_key` requests. Everything else needs an allowed key.
                     if !self.allowed.contains(&source) && !self.is_echo_reply_to_us(&data) {
                         continue;
-                    }
-                    let our = self.node.address().0;
-                    let ip = unframe_ipv6(&data);
-                    if self.forward_handle(source, ip) {
-                        continue;
-                    }
-                    if let Some(seg) = tcp::parse(ip) {
-                        if seg.dst == our && seg.dport == tcp::HTTP_PORT {
-                            if let Some(srv) = self.http.as_mut() {
-                                let pkts = srv.handle(our, &seg);
-                                for pkt in pkts {
-                                    self.outbox.push_back((source, frame_ipv6(&pkt)));
-                                }
-                                continue;
-                            }
-                        }
                     }
                     if let Some(echo) = icmp::parse_echo(ip) {
                         if echo.dst == self.address().0 && echo.kind == ECHO_REQUEST {
@@ -992,79 +1086,141 @@ mod tests {
         assert_eq!(reply.from, b_addr);
     }
 
-    /// Send a TCP packet from endpoint `from` to the node with key `to`.
-    fn send_tcp(net: &mut Net, rng: &mut OsRng, from: usize, to: PublicKey, pkt: Vec<u8>) {
-        let acts = net.eps[from].send_to_key(&to, &frame_ipv6(&pkt), net.now, rng);
-        net.submit(from, acts, rng);
-    }
-
-    /// Next TCP segment that reaches endpoint `idx` and satisfies `want`.
-    fn tcp_recv_where(net: &mut Net, rng: &mut OsRng, idx: usize, want: impl Fn(&tcp::Segment) -> bool) -> tcp::Segment {
-        for _ in 0..20 {
-            let r = net.wait_recv(idx, rng, 200).expect("segment reaches the client");
-            if let Some(seg) = tcp::parse(unframe_ipv6(&r.data)) {
-                if want(&seg) {
-                    return seg;
-                }
+    /// Run the net until `done` holds (at most `steps` polls).
+    fn run_until(net: &mut Net, rng: &mut OsRng, steps: usize, mut done: impl FnMut(&mut Net) -> bool) -> bool {
+        for _ in 0..steps {
+            if done(net) {
+                return true;
             }
+            net.run(1, rng);
         }
-        panic!("no matching TCP segment");
+        done(net)
     }
 
     #[test]
-    fn forwarded_port_carries_bytes_both_ways() {
+    fn tcp_connection_carries_bytes_both_ways_and_closes() {
         let mut rng = OsRng;
         let mut net = Net::new();
         let a_key = *net.eps[0].public_key();
-        let b_key = *net.eps[1].public_key();
-        let a_addr = net.eps[0].address().0;
-        let b_addr = net.eps[1].address().0;
-        net.eps[1].set_forward_ports(&[22]);
+        net.eps[1].tcp_listen(22);
+        // B allows A. A allows nobody: replies on A's own connection still arrive.
         net.eps[1].set_allowed_keys(vec![a_key]);
-        net.eps[0].set_allowed_keys(vec![b_key]);
         net.run(30, &mut rng);
 
-        // Client connects to B:22.
-        send_tcp(&mut net, &mut rng, 0, b_key, tcp::build(a_addr, b_addr, 40000, 22, 100, 0, tcp::SYN, &[], true));
-        let id = match net.eps[1].forward_event() {
-            Some(forward::Event::Open { id, port: 22 }) => id,
-            other => panic!("expected Open, got {other:?}"),
-        };
-        let synack = tcp_recv_where(&mut net, &mut rng, 0, |s| s.has(tcp::SYN));
-        assert!(synack.has(tcp::ACK));
-        let iss = synack.seq;
+        let b_addr = net.eps[1].address();
+        let a_id = net.eps[0].tcp_connect(&b_addr, 22).expect("connect");
+        let mut b_id = None;
+        let mut a_up = false;
+        assert!(run_until(&mut net, &mut rng, 200, |net| {
+            while let Some(ev) = net.eps[1].tcp_event() {
+                if let tcp_stack::Event::Accepted { id, port: 22 } = ev {
+                    b_id = Some(id);
+                }
+            }
+            while let Some(ev) = net.eps[0].tcp_event() {
+                if ev == (tcp_stack::Event::Connected { id: a_id }) {
+                    a_up = true;
+                }
+            }
+            a_up && b_id.is_some()
+        }), "handshake completes");
+        let b_id = b_id.unwrap();
 
-        // Client: ACK of the SYN-ACK plus "hello". B delivers it to the local side.
-        send_tcp(&mut net, &mut rng, 0, b_key, tcp::build(a_addr, b_addr, 40000, 22, 101, iss.wrapping_add(1), tcp::PSH | tcp::ACK, b"hello", false));
-        assert_eq!(net.eps[1].forward_event(), Some(forward::Event::Data { id, data: b"hello".to_vec() }));
+        // 300 KB from A to B, 100 KB back.
+        let up: Vec<u8> = (0..300_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let down: Vec<u8> = (0..100_000u32).map(|i| (i * 13 % 241) as u8).collect();
+        let (mut up_sent, mut down_sent) = (0, 0);
+        let (mut got_b, mut got_a) = (Vec::new(), Vec::new());
+        let mut buf = [0u8; 4096];
+        assert!(run_until(&mut net, &mut rng, 5_000, |net| {
+            up_sent += net.eps[0].tcp_write(a_id, &up[up_sent..]);
+            down_sent += net.eps[1].tcp_write(b_id, &down[down_sent..]);
+            loop {
+                let n = net.eps[1].tcp_read(b_id, &mut buf);
+                if n == 0 { break; }
+                got_b.extend_from_slice(&buf[..n]);
+            }
+            loop {
+                let n = net.eps[0].tcp_read(a_id, &mut buf);
+                if n == 0 { break; }
+                got_a.extend_from_slice(&buf[..n]);
+            }
+            got_b.len() == up.len() && got_a.len() == down.len()
+        }), "data arrives (got {} / {})", got_b.len(), got_a.len());
+        assert!(got_b == up && got_a == down, "data intact");
 
-        // Local side answers "world"; the client receives it.
-        assert!(net.eps[1].forward_write(id, b"world"));
-        let world = tcp_recv_where(&mut net, &mut rng, 0, |s| !s.payload.is_empty());
-        assert_eq!(world.payload, b"world".to_vec());
-        assert_eq!(world.seq, iss.wrapping_add(1));
-
-        // Client closes: B reports RemoteFin; the local side closes, and the client acks B's FIN.
-        send_tcp(&mut net, &mut rng, 0, b_key, tcp::build(a_addr, b_addr, 40000, 22, 106, iss.wrapping_add(6), tcp::FIN | tcp::ACK, &[], false));
-        assert_eq!(net.eps[1].forward_event(), Some(forward::Event::RemoteFin { id }));
-        net.eps[1].forward_close(id);
-        let fin = tcp_recv_where(&mut net, &mut rng, 0, |s| s.has(tcp::FIN));
-        send_tcp(&mut net, &mut rng, 0, b_key, tcp::build(a_addr, b_addr, 40000, 22, 107, fin.seq.wrapping_add(1), tcp::ACK, &[], false));
-        assert_eq!(net.eps[1].forward_event(), Some(forward::Event::Closed { id }));
+        // Both close; both sides report RemoteFin and Closed.
+        net.eps[0].tcp_close(a_id);
+        net.eps[1].tcp_close(b_id);
+        let (mut a_closed, mut b_closed) = (false, false);
+        assert!(run_until(&mut net, &mut rng, 300, |net| {
+            while let Some(ev) = net.eps[0].tcp_event() {
+                if matches!(ev, tcp_stack::Event::Closed { reason: tcp_stack::CloseReason::Normal, .. }) {
+                    a_closed = true;
+                }
+            }
+            while let Some(ev) = net.eps[1].tcp_event() {
+                if matches!(ev, tcp_stack::Event::Closed { reason: tcp_stack::CloseReason::Normal, .. }) {
+                    b_closed = true;
+                }
+            }
+            a_closed && b_closed
+        }), "both sides close normally");
     }
 
     #[test]
-    fn forwarding_ignores_keys_that_are_not_allowed() {
+    fn http_page_is_served_over_tcp() {
         let mut rng = OsRng;
         let mut net = Net::new();
-        let b_key = *net.eps[1].public_key();
-        let a_addr = net.eps[0].address().0;
-        let b_addr = net.eps[1].address().0;
-        net.eps[1].set_forward_ports(&[22]);
-        // B allows nobody: A's segments are dropped before the forwarder sees them.
+        let a_key = *net.eps[0].public_key();
+        net.eps[1].serve_http(b"<p>status</p>".to_vec());
+        net.eps[1].set_allowed_keys(vec![a_key]);
         net.run(30, &mut rng);
-        send_tcp(&mut net, &mut rng, 0, b_key, tcp::build(a_addr, b_addr, 40000, 22, 100, 0, tcp::SYN, &[], true));
-        assert!(net.eps[1].forward_event().is_none());
+
+        let b_addr = net.eps[1].address();
+        let id = net.eps[0].tcp_connect(&b_addr, 80).unwrap();
+        let mut sent = false;
+        let mut body = Vec::new();
+        let mut buf = [0u8; 2048];
+        assert!(run_until(&mut net, &mut rng, 300, |net| {
+            let mut fin = false;
+            while let Some(ev) = net.eps[0].tcp_event() {
+                if ev == (tcp_stack::Event::Connected { id }) && !sent {
+                    net.eps[0].tcp_write(id, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+                    sent = true;
+                }
+                if ev == (tcp_stack::Event::RemoteFin { id }) {
+                    fin = true;
+                }
+            }
+            loop {
+                let n = net.eps[0].tcp_read(id, &mut buf);
+                if n == 0 { break; }
+                body.extend_from_slice(&buf[..n]);
+            }
+            fin
+        }));
+        let text = core::str::from_utf8(&body).unwrap();
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "{text}");
+        assert!(text.ends_with("<p>status</p>"));
+        // The page server's connection is not reported to the application.
+        assert!(net.eps[1].tcp_event().is_none());
+    }
+
+    #[test]
+    fn tcp_from_keys_that_are_not_allowed_is_ignored() {
+        let mut rng = OsRng;
+        let mut net = Net::new();
+        net.eps[1].tcp_listen(22);
+        // B allows nobody: A's SYN is dropped silently, nothing is accepted.
+        net.run(30, &mut rng);
+        let b_addr = net.eps[1].address();
+        let id = net.eps[0].tcp_connect(&b_addr, 22).unwrap();
+        net.run(50, &mut rng);
+        assert!(net.eps[1].tcp_event().is_none());
+        assert_eq!(net.eps[1].tcp_connections().len(), 0);
+        assert!(net.eps[0].tcp_event().is_none(), "A is still trying, no RST came back");
+        net.eps[0].tcp_abort(id);
     }
 
     #[test]
@@ -1135,56 +1291,6 @@ mod tests {
         assert_eq!(echo.payload, PING_PAYLOAD.to_vec());
         assert!(net.eps[1].recv().is_none(), "requests are not delivered to the app");
         assert_eq!(reply.data[0], IPV6_FRAME, "replies are framed");
-    }
-
-    #[test]
-    fn serves_html_page_over_tcp() {
-        let mut rng = OsRng;
-        let mut net = Net::new();
-        let a_key = *net.eps[0].public_key();
-        let b_key = *net.eps[1].public_key();
-        net.eps[1].set_allowed_keys(vec![a_key]);
-        net.eps[0].set_allowed_keys(vec![b_key]);
-        net.eps[1].serve_http(b"<html>ok</html>".to_vec());
-        net.run(30, &mut rng);
-        let a_addr = net.eps[0].address().0;
-        let b_addr = net.eps[1].address();
-
-        let syn = frame_ipv6(&tcp::build(a_addr, b_addr.0, 50000, 80, 100, 0, 0x02, &[], true));
-        let acts = net.eps[0].send_to_address(&b_addr, &syn, net.now, &mut rng);
-        net.submit(0, acts, &mut rng);
-        let synack = next_tcp(&mut net, &mut rng).expect("SYN-ACK");
-        assert!(synack.has(0x02) && synack.has(0x10));
-
-        let get = tcp::build(a_addr, b_addr.0, 50000, 80, 101, synack.seq.wrapping_add(1), 0x18,
-            b"GET / HTTP/1.1\r\nHost: x\r\n\r\n", false);
-        let acts = net.eps[0].send_to_address(&b_addr, &get, net.now, &mut rng);
-        net.submit(0, acts, &mut rng);
-
-        let mut body = Vec::new();
-        let mut saw_fin = false;
-        while let Some(seg) = next_tcp(&mut net, &mut rng) {
-            body.extend_from_slice(&seg.payload);
-            if seg.has(0x01) { saw_fin = true; break; }
-        }
-        let text = String::from_utf8_lossy(&body).to_string();
-        assert!(text.starts_with("HTTP/1.1 200 OK"), "got: {text}");
-        assert!(text.ends_with("<html>ok</html>"));
-        assert!(saw_fin);
-    }
-
-    /// Next TCP segment delivered to node 0, pumping the network while waiting.
-    fn next_tcp(net: &mut Net, rng: &mut OsRng) -> Option<tcp::Segment> {
-        for _ in 0..200 {
-            if let Some(msg) = net.eps[0].recv() {
-                if let Some(seg) = tcp::parse(unframe_ipv6(&msg.data)) {
-                    return Some(seg);
-                }
-                continue;
-            }
-            net.run(1, rng);
-        }
-        None
     }
 
     #[test]

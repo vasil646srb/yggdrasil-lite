@@ -4,13 +4,22 @@
 //! datagrams only from allowed keys, and can send a periodic test message.
 //!
 //! Usage:
+//!   tcp_node                      # key ./ygg.key or ~/ygg.key, public peer list
 //!   tcp_node --key ~/ygg.key --peers ~/peers.json --allow <hex-key> \
 //!            [--target 3] [--ping <ipv6>] [--send <ipv6> <message>]
+//!
+//! Without `--peers` the public peer list is downloaded in the background
+//! (curl, wget or uclient-fetch), cached next to the key file, refreshed every
+//! 6 hours and retried every minute while it fails. The node starts dialing
+//! as soon as it has candidates (the cache is used right away).
 //!
 //! `--forward PORT[:LOCAL]` (repeatable, comma-separated) lets allowed nodes reach
 //! TCP ports on this host over Yggdrasil: `--forward 22` maps overlay port 22 to
 //! 127.0.0.1:22, `--forward 2222:22` maps overlay port 2222 to 127.0.0.1:22.
 //! Only keys given with `--allow` can connect, and only the listed ports are open.
+//!
+//! `--connect LPORT:[ADDR]:PORT` (repeatable) is the reverse: local programs
+//! connect to 127.0.0.1:LPORT and are carried to `[ADDR]:PORT` over Yggdrasil.
 //!
 //! `--quality-interval SECS` (default 300) sets how often the global network is
 //! re-checked: peers are grouped by tree root, peers on another root are dropped,
@@ -168,13 +177,14 @@ use rand::RngCore;
 use yggdrasil_lite::icmp::{self, ECHO_REPLY};
 use yggdrasil_lite::peerlist::DEFAULT_PUBLIC_PEERS_URL;
 use yggdrasil_lite::uri::TcpPeerUri;
-use yggdrasil_lite::forward::{self, Event as FwdEvent};
+use yggdrasil_lite::{CloseReason, ConnId, TcpEvent};
 use yggdrasil_lite::quality::{PeerView, Quality, Verdict, DEFAULT_RECHECK_MS};
 use yggdrasil_lite::address::addr_for_key;
 use yggdrasil_lite::{frame_ipv6, unframe_ipv6, udp, Action, Address, CandidateSource, Direction, Endpoint, PublicKey};
 
 struct Args {
-    key: String,
+    /// `--key FILE`; default: ./ygg.key if it exists, else ~/ygg.key.
+    key: Option<String>,
     peers: Option<String>,
     allow: Vec<String>,
     target: usize,
@@ -197,6 +207,8 @@ struct Args {
     lan_target: Option<usize>,
     /// `--listen PORT`: accept inbound TCP peers and advertise this port in beacons.
     listen: Option<u16>,
+    /// `--connect LPORT:[ADDR]:PORT`: local listener carried to a remote overlay port.
+    connects: Vec<(u16, Ipv6Addr, u16)>,
 }
 
 const DEFAULT_PAGE: &str = "<!doctype html>
@@ -207,17 +219,65 @@ const DEFAULT_PAGE: &str = "<!doctype html>
 </body></html>
 ";
 
+const USAGE: &str = "usage: tcp_node [options]
+
+With no options the node creates or loads its key (./ygg.key, else ~/ygg.key),
+downloads the public peer list and connects.
+
+  --key FILE                identity file (created on first run)
+  --peers FILE              local peer list instead of the public one
+  --no-public               do not download the public peer list
+  --target N                outbound peers to keep (1..=32, default 3)
+  --allow HEXKEY            key allowed to use forwards, ping and the page (repeatable)
+  --forward PORT[:LOCAL],.. expose local TCP ports over Yggdrasil
+  --connect LPORT:[ADDR]:PORT
+                            carry 127.0.0.1:LPORT to [ADDR]:PORT over Yggdrasil
+  --forward-udp PORT[:LOCAL],..  expose local UDP ports
+  --api ADDR                status dashboard and /api/stats (loopback only)
+  --html FILE               page served on overlay port 80
+  --ping IPV6               echo request every second
+  --send IPV6 MESSAGE       datagram every 10 s (test aid)
+  --send-udp IPV6 PORT MSG  UDP datagram every 5 s (test aid)
+  --quality-interval SECS   network re-check interval (default 300)
+  --listen PORT             accept plain TCP peers on this port
+  --lan-upstream            dial yggdrasil-go LAN peers (needs upstream-tls build)
+  --lan-target N            outbound slots for LAN peers";
+
 fn usage() -> ! {
-    eprintln!("usage: tcp_node --key FILE [--peers FILE] [--allow HEXKEY]... [--target N] [--ping IPV6] [--send IPV6 MESSAGE] [--html FILE] [--api ADDR] [--quality-interval SECS] [--forward PORT[:LOCAL],...] [--forward-udp PORT[:LOCAL],...] [--listen PORT] [--lan-upstream] [--no-public] [--lan-target N]");
+    eprintln!("{USAGE}");
     std::process::exit(2);
 }
 
+/// `LPORT:[ADDR]:PORT`.
+fn parse_connect(spec: &str) -> Result<(u16, Ipv6Addr, u16), String> {
+    let bad = || format!("bad --connect '{spec}' (want LPORT:[IPV6]:PORT)");
+    let (lport, rest) = spec.split_once(':').ok_or_else(bad)?;
+    let rest = rest.strip_prefix('[').ok_or_else(bad)?;
+    let (addr, rest) = rest.split_once(']').ok_or_else(bad)?;
+    let port = rest.strip_prefix(':').ok_or_else(bad)?;
+    let lport: u16 = lport.parse().ok().filter(|p| *p > 0).ok_or_else(bad)?;
+    let port: u16 = port.parse().ok().filter(|p| *p > 0).ok_or_else(bad)?;
+    let addr: Ipv6Addr = addr.parse().map_err(|_| bad())?;
+    Ok((lport, addr, port))
+}
+
 fn parse_args() -> Args {
-    let mut a = Args { key: String::new(), peers: None, allow: Vec::new(), target: 3, send: None, ping: None, html: None, api: None, quality_ms: DEFAULT_RECHECK_MS, forwards: Vec::new(), forwards_udp: Vec::new(), send_udp: None, lan_upstream: false, no_public: false, listen: None, lan_target: None };
+    let mut a = Args { key: None, connects: Vec::new(), peers: None, allow: Vec::new(), target: 3, send: None, ping: None, html: None, api: None, quality_ms: DEFAULT_RECHECK_MS, forwards: Vec::new(), forwards_udp: Vec::new(), send_udp: None, lan_upstream: false, no_public: false, listen: None, lan_target: None };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         match flag.as_str() {
-            "--key" => a.key = it.next().unwrap_or_else(|| usage()),
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                std::process::exit(0);
+            }
+            "--key" => a.key = Some(it.next().unwrap_or_else(|| usage())),
+            "--connect" => {
+                let spec = it.next().unwrap_or_else(|| usage());
+                a.connects.push(parse_connect(&spec).unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }));
+            }
             "--peers" => a.peers = Some(it.next().unwrap_or_else(|| usage())),
             "--allow" => a.allow.push(it.next().unwrap_or_else(|| usage())),
             "--target" => a.target = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
@@ -264,9 +324,6 @@ fn parse_args() -> Args {
             _ => usage(),
         }
     }
-    if a.key.is_empty() {
-        usage();
-    }
     if a.forwards_udp.len() > 16 {
         eprintln!("at most 16 UDP forwarded ports");
         std::process::exit(2);
@@ -308,9 +365,76 @@ fn connect_local(port: u16) -> Option<TcpStream> {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).ok()?;
     let _ = s.set_nodelay(true);
-    let _ = s.set_read_timeout(Some(Duration::from_millis(1)));
-    let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
+    s.set_nonblocking(true).ok()?;
     Some(s)
+}
+
+/// An overlay TCP connection bridged to a local socket (both directions, non-blocking).
+struct Bridge {
+    sock: TcpStream,
+    /// Bytes read from the overlay and not yet written to the local socket.
+    to_local: Vec<u8>,
+    to_local_off: usize,
+    /// The local program finished sending; our FIN is queued.
+    local_eof: bool,
+    /// The overlay peer finished sending.
+    remote_eof: bool,
+    /// Local write side shut down after `remote_eof`.
+    shut_wr: bool,
+    label: String,
+}
+
+impl Bridge {
+    fn new(sock: TcpStream, label: String) -> Self {
+        Self { sock, to_local: Vec::new(), to_local_off: 0, local_eof: false, remote_eof: false, shut_wr: false, label }
+    }
+}
+
+const BRIDGE_CHUNK: usize = 64 * 1024;
+
+/// Move bytes both ways for one bridge. Returns `false` if the local socket failed.
+fn pump_bridge(ep: &mut Endpoint, id: ConnId, b: &mut Bridge, buf: &mut [u8]) -> bool {
+    // Overlay -> local.
+    loop {
+        if b.to_local_off == b.to_local.len() {
+            b.to_local.clear();
+            b.to_local_off = 0;
+            let n = ep.tcp_read(id, buf);
+            if n == 0 {
+                break;
+            }
+            b.to_local.extend_from_slice(&buf[..n]);
+        }
+        match b.sock.write(&b.to_local[b.to_local_off..]) {
+            Ok(0) => return false,
+            Ok(n) => b.to_local_off += n,
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => break,
+            Err(_) => return false,
+        }
+    }
+    if b.remote_eof && !b.shut_wr && b.to_local_off == b.to_local.len() {
+        let _ = b.sock.shutdown(Shutdown::Write);
+        b.shut_wr = true;
+    }
+    // Local -> overlay, only as much as the send buffer takes.
+    while !b.local_eof {
+        let space = ep.tcp_send_space(id).min(buf.len());
+        if space == 0 {
+            break;
+        }
+        match b.sock.read(&mut buf[..space]) {
+            Ok(0) => {
+                b.local_eof = true;
+                ep.tcp_close(id);
+            }
+            Ok(n) => {
+                ep.tcp_write(id, &buf[..n]);
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => break,
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -332,19 +456,67 @@ fn unhex(s: &str) -> Result<Vec<u8>, Box<dyn Error>> {
         .collect()
 }
 
-/// Fetch the public peer list with `curl` (HTTPS is not built into this binary).
-fn download_public_peers() -> Result<Vec<u8>, Box<dyn Error>> {
-    let out = std::process::Command::new("curl")
-        .args(["-fsSL", "--max-time", "30", DEFAULT_PUBLIC_PEERS_URL])
-        .output()
-        .map_err(|e| format!("cannot run curl: {e}"))?;
-    if !out.status.success() {
-        return Err(format!("curl failed ({}): {}", out.status, String::from_utf8_lossy(&out.stderr).trim()).into());
+/// Fetch the public peer list. HTTPS is not built into this binary, so an
+/// external tool does it: curl, wget, or OpenWrt's uclient-fetch.
+fn download_public_peers() -> Result<Vec<u8>, String> {
+    let tools: [(&str, &[&str]); 3] = [
+        ("curl", &["-fsSL", "--max-time", "30"]),
+        ("wget", &["-q", "-T", "30", "-O", "-"]),
+        ("uclient-fetch", &["-q", "-T", "30", "-O", "-"]),
+    ];
+    let mut errors = Vec::new();
+    for (tool, args) in tools {
+        match std::process::Command::new(tool).args(args).arg(DEFAULT_PUBLIC_PEERS_URL).output() {
+            Ok(out) if out.status.success() && !out.stdout.is_empty() => return Ok(out.stdout),
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                errors.push(format!("{tool}: {} {err}", out.status));
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => errors.push(format!("{tool}: not installed")),
+            Err(e) => errors.push(format!("{tool}: {e}")),
+        }
     }
-    if out.stdout.is_empty() {
-        return Err("empty response".into());
+    Err(errors.join("; "))
+}
+
+/// Peer list refresh after a successful download, and retry after a failure.
+const PEER_LIST_REFRESH: Duration = Duration::from_secs(6 * 3600);
+const PEER_LIST_RETRY: Duration = Duration::from_secs(60);
+
+/// Download the public list in the background: now, then every 6 h, retrying every minute on failure.
+fn spawn_peer_fetcher(tx: mpsc::Sender<Result<Vec<u8>, String>>) {
+    std::thread::spawn(move || loop {
+        let res = download_public_peers();
+        let wait = if res.is_ok() { PEER_LIST_REFRESH } else { PEER_LIST_RETRY };
+        if tx.send(res).is_err() {
+            return;
+        }
+        std::thread::sleep(wait);
+    });
+}
+
+/// Default key file: ./ygg.key if present, otherwise ~/ygg.key.
+fn default_key_path() -> String {
+    if std::path::Path::new("ygg.key").exists() {
+        return "ygg.key".into();
     }
-    Ok(out.stdout)
+    match std::env::var_os("HOME") {
+        Some(home) if !home.is_empty() => std::path::Path::new(&home).join("ygg.key").display().to_string(),
+        _ => "ygg.key".into(),
+    }
+}
+
+/// The downloaded peer list is cached next to the key file.
+fn peer_cache_path(key_path: &str) -> std::path::PathBuf {
+    std::path::Path::new(key_path).with_file_name("peers-cache.json")
+}
+
+fn save_peer_cache(path: &std::path::Path, json: &[u8]) {
+    let tmp = path.with_extension("json.tmp");
+    let res = std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, path));
+    if let Err(e) = res {
+        eprintln!("peers: cannot write cache {}: {e}", path.display());
+    }
 }
 
 /// Read the 32-byte seed from `path`, creating it with fresh randomness if absent.
@@ -686,7 +858,15 @@ fn short_key(k: &PublicKey) -> String {
 /// Print the connected peers as a table: direction, endpoint, key, address, RTT, uptime.
 fn print_peers(ep: &Endpoint, sockets: usize, now: u64) {
     let peers = ep.connected_peers();
-    println!("peers: {}  sockets: {}", peers.len(), sockets);
+    println!("peers: {}  sockets: {}  candidates: {}", peers.len(), sockets, ep.candidates().len());
+    for c in ep.tcp_connections() {
+        let srtt = c.srtt_ms.map(|r| format!("{r} ms")).unwrap_or_else(|| "?".into());
+        println!(
+            "  tcp {} {:?} [{}]:{} local {} rtt={srtt} cwnd={} sent={} recv={} rexmit={}",
+            c.id, c.state, Ipv6Addr::from(c.remote), c.remote_port, c.local_port,
+            c.cwnd, c.bytes_sent, c.bytes_received, c.retransmits
+        );
+    }
     for p in peers {
         let uptime = now.saturating_sub(p.up_ms) / 1000;
         let key: String = p.key.iter().take(4).map(|b| format!("{:02x}", b)).collect();
@@ -706,7 +886,10 @@ fn print_peers(ep: &Endpoint, sockets: usize, now: u64) {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = parse_args();
-    let seed = load_or_create_seed(&args.key)?;
+    let key_path = args.key.clone().unwrap_or_else(default_key_path);
+    let existed = std::path::Path::new(&key_path).exists();
+    let seed = load_or_create_seed(&key_path).map_err(|e| format!("key file {key_path}: {e}"))?;
+    println!("key:            {key_path}{}", if existed { "" } else { " (new)" });
     if let Some(n) = args.lan_target {
         if !(1..=MAX_TARGET).contains(&n) {
             eprintln!("--lan-target must be between 1 and {MAX_TARGET} (got {n})");
@@ -719,6 +902,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let lan_slots = if args.lan_upstream { args.lan_target.unwrap_or(args.target) } else { 0 };
     let mut ep = Endpoint::new_with_lan(seed, None, args.target, lan_slots);
+    // tls:// peers only when this build can dial them.
+    ep.set_tls_peers(cfg!(feature = "upstream-tls"));
+    let cache_path = peer_cache_path(&key_path);
+    let mut peer_rx: Option<mpsc::Receiver<Result<Vec<u8>, String>>> = None;
 
     match &args.peers {
         Some(path) => {
@@ -730,15 +917,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!("peers:          no public list (--no-public): LAN and --peers only");
         }
         None => {
-            // No --peers: fetch the public list. Failure is fatal, so the log shows why.
-            println!("peers:          downloading {DEFAULT_PUBLIC_PEERS_URL}");
-            let json = download_public_peers()
-                .map_err(|e| format!("peer list download failed: {e} (install curl, or pass --peers FILE)"))?;
-            let added = ep.import_peer_list(&json, CandidateSource::Config);
-            if added == 0 {
-                return Err(format!("downloaded peer list has no usable TCP peers ({} bytes)", json.len()).into());
+            // No --peers: start with the cached list, download a fresh one in the background.
+            if let Ok(json) = std::fs::read(&cache_path) {
+                let added = ep.import_peer_list(&json, CandidateSource::Config);
+                println!("peers:          {added} from cache {}", cache_path.display());
             }
-            println!("imported {added} TCP peers from {DEFAULT_PUBLIC_PEERS_URL}");
+            println!("peers:          downloading {DEFAULT_PUBLIC_PEERS_URL}");
+            let (tx, rx) = mpsc::channel();
+            spawn_peer_fetcher(tx);
+            peer_rx = Some(rx);
         }
     }
     let allow_keys: Vec<PublicKey> = args.allow.iter().map(|k| parse_key(k)).collect::<Result<_, _>>()?;
@@ -766,12 +953,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let forward_map: HashMap<u16, u16> = args.forwards.iter().copied().collect();
-    let forward_ports: Vec<u16> = args.forwards.iter().map(|(o, _)| *o).collect();
-    ep.set_forward_ports(&forward_ports);
     for (overlay, local) in &args.forwards {
+        ep.tcp_listen(*overlay);
         println!("forward:        overlay port {overlay} -> 127.0.0.1:{local}");
     }
-    if forward_ports.contains(&80) {
+    let mut connect_listeners: Vec<(TcpListener, Ipv6Addr, u16)> = Vec::new();
+    for (lport, addr, port) in &args.connects {
+        let l = TcpListener::bind((Ipv4Addr::LOCALHOST, *lport))
+            .map_err(|e| format!("--connect: cannot listen on 127.0.0.1:{lport}: {e}"))?;
+        l.set_nonblocking(true)?;
+        println!("connect:        127.0.0.1:{lport} -> [{addr}]:{port}");
+        connect_listeners.push((l, *addr, *port));
+    }
+    if forward_map.contains_key(&80) {
         println!("note: overlay port 80 is forwarded, so the overlay status page is not served");
     }
 
@@ -811,8 +1005,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut probe_sent: HashMap<PublicKey, (u64, ProbeNonce)> = HashMap::new();
     let mut root_probe: Option<(PublicKey, u64, ProbeNonce)> = None;
     let mut last_probe = Instant::now() - PEER_PROBE_INTERVAL;
-    let mut fwd_streams: HashMap<u32, TcpStream> = HashMap::new();
-    let mut fwd_eof: HashSet<u32> = HashSet::new();
+    let mut bridges: HashMap<ConnId, Bridge> = HashMap::new();
+    let mut bridge_buf = vec![0u8; BRIDGE_CHUNK];
+    let mut peer_buf = vec![0u8; 64 * 1024];
     let mut last_send = Instant::now();
     let mut last_send_udp = Instant::now() - Duration::from_secs(5);
     let mut last_ping = Instant::now() - Duration::from_secs(1);
@@ -856,6 +1051,30 @@ fn main() -> Result<(), Box<dyn Error>> {
         let now = clock(start);
         let actions = ep.poll(now, &mut rng);
         run(actions, &mut ep, &mut streams, now);
+
+        // Public peer list from the background fetcher.
+        if let Some(rx) = peer_rx.as_ref() {
+            while let Ok(res) = rx.try_recv() {
+                match res {
+                    Ok(json) => {
+                        let added = ep.import_peer_list(&json, CandidateSource::Config);
+                        println!(
+                            "peers:          downloaded {} bytes, {added} new, {} candidates",
+                            json.len(),
+                            ep.candidates().len()
+                        );
+                        save_peer_cache(&cache_path, &json);
+                        if added > 0 {
+                            probe_next = Instant::now();
+                        }
+                    }
+                    Err(e) => println!(
+                        "peers:          download failed ({e}); retry in {} s",
+                        PEER_LIST_RETRY.as_secs()
+                    ),
+                }
+            }
+        }
 
         // yggdrasil-go LAN beacons: listen only, never send. Each beacon's source is a link-local
         // address whose scope id is the interface; keep it so we can dial that exact address.
@@ -944,26 +1163,34 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         let slots: Vec<usize> = streams.keys().copied().collect();
         for slot in slots {
-            let mut buf = [0u8; 4096];
-            let read = match streams.get_mut(&slot) {
-                Some(s) => s.read(&mut buf),
-                None => continue,
-            };
-            match read {
-                Ok(0) => {
-                    println!("peer slot {slot}: closed by remote (EOF) at {now} ms");
-                    streams.remove(&slot);
-                    ep.on_transport_closed(slot, now);
-                }
-                Ok(n) => {
-                    let actions = ep.on_bytes(slot, &buf[..n], now, &mut rng);
-                    run(actions, &mut ep, &mut streams, now);
-                }
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => {}
-                Err(e) => {
-                    println!("peer slot {slot}: read error at {now} ms: {e} ({:?})", e.kind());
-                    streams.remove(&slot);
-                    ep.on_transport_closed(slot, now);
+            // Keep reading while the buffer comes back full: a busy link would
+            // otherwise be limited to one buffer per loop pass.
+            for _ in 0..8 {
+                let read = match streams.get_mut(&slot) {
+                    Some(s) => s.read(&mut peer_buf),
+                    None => break,
+                };
+                match read {
+                    Ok(0) => {
+                        println!("peer slot {slot}: closed by remote (EOF) at {now} ms");
+                        streams.remove(&slot);
+                        ep.on_transport_closed(slot, now);
+                        break;
+                    }
+                    Ok(n) => {
+                        let actions = ep.on_bytes(slot, &peer_buf[..n], now, &mut rng);
+                        run(actions, &mut ep, &mut streams, now);
+                        if n < peer_buf.len() {
+                            break;
+                        }
+                    }
+                    Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => break,
+                    Err(e) => {
+                        println!("peer slot {slot}: read error at {now} ms: {e} ({:?})", e.kind());
+                        streams.remove(&slot);
+                        ep.on_transport_closed(slot, now);
+                        break;
+                    }
                 }
             }
         }
@@ -1071,71 +1298,70 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
-        // Port forwarding: open local sockets for remote clients and move bytes both ways.
-        while let Some(ev) = ep.forward_event() {
-            match ev {
-                FwdEvent::Open { id, port } => {
-                    let local = forward_map.get(&port).copied().unwrap_or(port);
-                    match connect_local(local) {
-                        Some(s) => {
-                            fwd_streams.insert(id, s);
-                        }
-                        None => {
-                            println!("forward: cannot connect to 127.0.0.1:{local}");
-                            ep.forward_abort(id);
-                        }
-                    }
+        // TCP over the overlay: --forward (remote clients in) and --connect (local clients out).
+        for (l, addr, port) in &connect_listeners {
+            while let Ok((sock, from)) = l.accept() {
+                let _ = sock.set_nodelay(true);
+                if sock.set_nonblocking(true).is_err() {
+                    continue;
                 }
-                FwdEvent::Data { id, data } => {
-                    let failed = match fwd_streams.get_mut(&id) {
-                        Some(s) => s.write_all(&data).is_err(),
-                        None => true,
-                    };
-                    if failed {
-                        fwd_streams.remove(&id);
-                        fwd_eof.remove(&id);
-                        ep.forward_abort(id);
+                match ep.tcp_connect(&Address(addr.octets()), *port) {
+                    Some(id) => {
+                        println!("tcp {id}: {from} -> [{addr}]:{port} connecting");
+                        bridges.insert(id, Bridge::new(sock, format!("[{addr}]:{port}")));
                     }
-                }
-                FwdEvent::RemoteFin { id } => {
-                    if let Some(s) = fwd_streams.get(&id) {
-                        let _ = s.shutdown(Shutdown::Write);
-                    }
-                }
-                FwdEvent::Closed { id } => {
-                    if let Some(s) = fwd_streams.remove(&id) {
-                        let _ = s.shutdown(Shutdown::Both);
-                    }
-                    fwd_eof.remove(&id);
+                    None => println!("tcp: connection limit reached, dropping {from}"),
                 }
             }
         }
-        let ids: Vec<u32> = fwd_streams.keys().copied().collect();
-        for id in ids {
-            // Read only when the queue has room for a full chunk: nothing is dropped.
-            if fwd_eof.contains(&id) || ep.forward_queued(id) > forward::SEND_QUEUE_MAX - forward::MAX_WRITE {
-                continue;
+        while let Some(ev) = ep.tcp_event() {
+            match ev {
+                TcpEvent::Accepted { id, port } => {
+                    let local = forward_map.get(&port).copied().unwrap_or(port);
+                    let peer = ep.tcp_remote(id).map(|(a, p)| format!("[{}]:{p}", Ipv6Addr::from(a.0))).unwrap_or_default();
+                    match connect_local(local) {
+                        Some(sock) => {
+                            println!("tcp {id}: {peer} -> overlay port {port} -> 127.0.0.1:{local}");
+                            bridges.insert(id, Bridge::new(sock, peer));
+                        }
+                        None => {
+                            println!("tcp {id}: cannot connect to 127.0.0.1:{local}, resetting {peer}");
+                            ep.tcp_abort(id);
+                        }
+                    }
+                }
+                TcpEvent::Connected { id } => {
+                    if let Some(b) = bridges.get(&id) {
+                        println!("tcp {id}: connected to {}", b.label);
+                    }
+                }
+                TcpEvent::Readable { .. } => {}
+                TcpEvent::RemoteFin { id } => {
+                    if let Some(b) = bridges.get_mut(&id) {
+                        b.remote_eof = true;
+                    }
+                }
+                TcpEvent::Closed { id, reason } => {
+                    if let Some(mut b) = bridges.remove(&id) {
+                        // Deliver what is still buffered before closing the local side.
+                        if reason == CloseReason::Normal {
+                            let _ = b.sock.set_nonblocking(false);
+                            let _ = b.sock.set_write_timeout(Some(Duration::from_secs(2)));
+                            let _ = b.sock.write_all(&b.to_local[b.to_local_off..]);
+                        }
+                        let _ = b.sock.shutdown(Shutdown::Both);
+                        println!("tcp {id}: {} closed ({reason:?})", b.label);
+                    }
+                }
             }
-            let mut buf = [0u8; forward::MAX_WRITE];
-            let read = match fwd_streams.get_mut(&id) {
-                Some(s) => s.read(&mut buf),
-                None => continue,
-            };
-            match read {
-                Ok(0) => {
-                    // Local side finished sending. Keep the socket for the reverse direction.
-                    fwd_eof.insert(id);
-                    ep.forward_close(id);
-                }
-                Ok(n) => {
-                    ep.forward_write(id, &buf[..n]);
-                }
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => {}
-                Err(_) => {
-                    fwd_streams.remove(&id);
-                    fwd_eof.remove(&id);
-                    ep.forward_abort(id);
-                }
+        }
+        let ids: Vec<ConnId> = bridges.keys().copied().collect();
+        for id in ids {
+            let Some(b) = bridges.get_mut(&id) else { continue };
+            if !pump_bridge(&mut ep, id, b, &mut bridge_buf) {
+                println!("tcp {id}: local socket failed, resetting {}", b.label);
+                bridges.remove(&id);
+                ep.tcp_abort(id);
             }
         }
 
@@ -1301,7 +1527,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         // Shorter sleep while forwarded sessions are open, so bytes are not delayed.
         // Loop period bounds the measured latency: each echo is picked up on the next pass, so
         // a 100 ms sleep added up to ~200 ms of error per round trip. 10 ms keeps it near the real value.
-        std::thread::sleep(Duration::from_millis(if fwd_streams.is_empty() { 10 } else { 5 }));
+        std::thread::sleep(Duration::from_millis(if bridges.is_empty() { 10 } else { 2 }));
     }
 }
 
