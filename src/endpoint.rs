@@ -148,6 +148,8 @@ pub struct Endpoint {
     tcp_out: VecDeque<([u8; 16], Vec<u8>)>,
     /// Optional page served on TCP port 80.
     http: Option<HttpServer>,
+    /// Overlay TCP port the HTTP page is served on ([`tcp::HTTP_PORT`] unless changed).
+    http_port: u16,
     /// Time of the last `poll`/`on_bytes` call, used to stamp TCP segments.
     last_now_ms: u64,
 }
@@ -232,6 +234,7 @@ impl Endpoint {
             tcp_events: VecDeque::new(),
             tcp_out: VecDeque::new(),
             http: None,
+            http_port: tcp::HTTP_PORT,
             last_now_ms: 0,
         }
     }
@@ -241,11 +244,21 @@ impl Endpoint {
     /// If the application listens on port 80 itself ([`tcp_listen`](Self::tcp_listen)),
     /// its listener wins and the page is not served.
     pub fn serve_http(&mut self, page: Vec<u8>) {
+        self.serve_http_on(tcp::HTTP_PORT, page);
+    }
+
+    /// Like [`serve_http`](Self::serve_http), on overlay TCP port `port`. Changing the port
+    /// of a running server stops listening on the old one.
+    pub fn serve_http_on(&mut self, port: u16, page: Vec<u8>) {
+        if self.http.is_some() && port != self.http_port && !self.tcp_ports.contains(&self.http_port) {
+            self.tcp.unlisten(self.http_port);
+        }
+        self.http_port = port;
         match self.http.as_mut() {
             Some(srv) => srv.set_page(page),
             None => self.http = Some(HttpServer::new(page)),
         }
-        self.tcp.listen(tcp::HTTP_PORT);
+        self.tcp.listen(port);
     }
 
     /// Enable or disable automatic replies to ICMPv6 echo requests.
@@ -319,7 +332,7 @@ impl Endpoint {
     /// Stop accepting connections on `port` (open ones stay).
     pub fn tcp_unlisten(&mut self, port: u16) {
         self.tcp_ports.retain(|p| *p != port);
-        if !(port == tcp::HTTP_PORT && self.http.is_some()) {
+        if !(port == self.http_port && self.http.is_some()) {
             self.tcp.unlisten(port);
         }
     }
@@ -816,9 +829,9 @@ impl Endpoint {
     fn after_tcp(&mut self) {
         for _ in 0..16 {
             while let Some(ev) = self.tcp.pop_event() {
-                let http_port_ours = !self.tcp_ports.contains(&tcp::HTTP_PORT);
+                let http_port_ours = !self.tcp_ports.contains(&self.http_port);
                 let to_http = match (&ev, self.http.as_mut()) {
-                    (tcp_stack::Event::Accepted { id, port }, Some(h)) if *port == tcp::HTTP_PORT && http_port_ours => {
+                    (tcp_stack::Event::Accepted { id, port }, Some(h)) if *port == self.http_port && http_port_ours => {
                         h.accept(*id);
                         true
                     }
@@ -1211,6 +1224,56 @@ mod tests {
         assert!(text.ends_with("<p>status</p>"));
         // The page server's connection is not reported to the application.
         assert!(net.eps[1].tcp_event().is_none());
+    }
+
+    /// The page can be served on another overlay port; port 80 then stays closed.
+    #[test]
+    fn http_page_can_use_another_port() {
+        let mut rng = OsRng;
+        let mut net = Net::new();
+        let a_key = *net.eps[0].public_key();
+        net.eps[1].serve_http_on(1080, b"<p>1080</p>".to_vec());
+        net.eps[1].set_allowed_keys(vec![a_key]);
+        net.run(30, &mut rng);
+        let b_addr = net.eps[1].address();
+
+        let fetch = |net: &mut Net, rng: &mut OsRng, port: u16| -> Option<String> {
+            let id = net.eps[0].tcp_connect(&b_addr, port).unwrap();
+            let mut sent = false;
+            let mut body = Vec::new();
+            let mut buf = [0u8; 2048];
+            let mut refused = false;
+            run_until(net, rng, 300, |net| {
+                let mut fin = false;
+                while let Some(ev) = net.eps[0].tcp_event() {
+                    match ev {
+                        tcp_stack::Event::Connected { id: i } if i == id && !sent => {
+                            net.eps[0].tcp_write(id, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+                            sent = true;
+                        }
+                        tcp_stack::Event::RemoteFin { id: i } if i == id => fin = true,
+                        tcp_stack::Event::Closed { id: i, .. } if i == id => refused = true,
+                        _ => {}
+                    }
+                }
+                loop {
+                    let n = net.eps[0].tcp_read(id, &mut buf);
+                    if n == 0 { break; }
+                    body.extend_from_slice(&buf[..n]);
+                }
+                fin || refused
+            });
+            if body.is_empty() { None } else { Some(String::from_utf8_lossy(&body).into_owned()) }
+        };
+        let page = fetch(&mut net, &mut rng, 1080).expect("page on 1080");
+        assert!(page.starts_with("HTTP/1.1 200 OK") && page.ends_with("<p>1080</p>"), "{page}");
+        assert!(fetch(&mut net, &mut rng, 80).is_none(), "port 80 is not served");
+
+        // Moving the server closes the old port and opens the new one.
+        net.eps[1].serve_http_on(8080, b"<p>8080</p>".to_vec());
+        net.run(10, &mut rng);
+        assert!(fetch(&mut net, &mut rng, 1080).is_none(), "old port closed");
+        assert!(fetch(&mut net, &mut rng, 8080).expect("page on 8080").ends_with("<p>8080</p>"));
     }
 
     #[test]
