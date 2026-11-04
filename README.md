@@ -25,17 +25,21 @@ for Termux (Android), Linux and OpenWrt routers.
 - IPv6 address derivation from the Ed25519 key (`200::/7`).
 - Optional transit routing (`transit` feature), with per-peer `no_redistribute` policy.
 - `no_std` + `alloc` library build for ESP32 (Embassy). Desktop builds use `std`.
-- `tcp_node`: public peer discovery, `--forward` TCP port forwarding, status API and
-  dashboard, ICMPv6 echo, and LAN discovery.
+- `tcp_node`: public peer list, peer search by latency (allowed keys first, root second),
+  TCP and UDP forwarding, ICMPv6 echo. Optional builds add an HTML status server (`html`)
+  and `tls://` peers with LAN discovery (`upstream-tls`).
 - LAN discovery of **yggdrasil-go** peers via their IPv6 link-local beacons
   (`--lan-upstream`), dialled over TLS (optional `upstream-tls` feature).
 
 ### Repository layout
 
 - `src/` — the library (`YggdrasilLite`, wire format, meta handshake, sessions).
-- `src/bin/tcp_node.rs` — the device binary.
+- `src/search.rs` — the peer search policy (when and which peer to replace), unit tested.
+- `src/bin/tcp_node.rs` — the device binary; `src/bin/tcp_node/` holds its optional parts
+  (`html`, `discovery`).
 - `examples/` — `lite_node`, `tun`, and the ESP32 firmware projects.
-- `tests/` — end-to-end scripts and transit tests.
+- `tests/` — transit tests, `peer_search.sh` (end-to-end peer search) and the yggstack scripts.
+- `scripts/` — `build-variants.sh` (the four builds), `termux.sh`, `build.sh`, `fetch-peers.sh`.
 - `openwrt/tcp_node.init` — OpenWrt service script.
 
 ### Build variants
@@ -91,9 +95,14 @@ unreachable peer no longer stalls the node.
 Tests:
 
 ```sh
-cargo test
-cargo test --features upstream-tls --bin tcp_node upstream_beacon
+cargo test --features transit                       # library, TCP stack, peer search, transit
+cargo test --features upstream-tls,html --bin tcp_node # also the TLS/LAN and HTML parts of tcp_node
+tests/peer_search.sh                                # peer search end to end on loopback (~4 min)
 ```
+
+`tests/peer_search.sh` starts real nodes, delays one peer's link by 100 ms each way and checks
+that the node replaces that peer once, judges the replacement, and does not churn when the
+alternative is just as slow.
 
 ### Running `tcp_node`
 
@@ -112,7 +121,7 @@ download is retried every minute, a successful one is refreshed every 6 hours.
 With options:
 
 ```sh
-./target/release/tcp_node --key ~/ygg.key --target 3 --api 127.0.0.1:8080
+./target/release/tcp_node --key ~/ygg.key --target 3
 ```
 
 Use a local peer list instead of downloading one:
@@ -171,8 +180,8 @@ Limits:
 - The TLS layer does not verify the peer's certificate, as yggdrasil-go does not. Peer
   identity comes from the signed metadata handshake that follows.
 - Passwordless networks only.
-- TLS comes from the system OpenSSL, so the device's OpenSSL version matters. The TLS build
-  only dials out; it does not listen.
+- TLS is rustls, built in: nothing depends on the device's OpenSSL. The TLS build only dials
+  out; it does not listen.
 
 #### Diagnostics
 
@@ -195,9 +204,10 @@ cargo build --release --bin tcp_node
 Keep the node running with the screen off: `termux-wake-lock`, and disable battery
 optimisation for Termux in Android settings.
 
-Open `http://127.0.0.1:8080/` in the phone browser for the dashboard, or query
-`http://127.0.0.1:8080/api/stats` in Termux. The API has no authentication and must not
-be bound to `0.0.0.0` on a shared network.
+In an `html` build (`cargo build --release --bin tcp_node --features html`, or
+`bash scripts/termux.sh build`) open `http://127.0.0.1:1080/` in the phone browser for the
+dashboard, or query `http://127.0.0.1:1080/api/stats` in Termux. The API has no
+authentication and is loopback only; do not move it to `0.0.0.0` on a shared network.
 
 ### TCP port forwarding (SSH to a router or phone)
 
@@ -318,8 +328,9 @@ Termux (Android), Linux и роутеров OpenWrt.
 - IPv6-адрес выводится из ключа Ed25519 (`200::/7`).
 - Транзитная маршрутизация по флагу `transit`, с политикой `no_redistribute` для каждого пира.
 - Сборка библиотеки `no_std` + `alloc` для ESP32 (Embassy). Для ПК используется `std`.
-- `tcp_node`: поиск публичных пиров, проброс TCP-портов `--forward`, сервер статуса и
-  дашборд, ICMPv6 echo, поиск пиров в LAN.
+- `tcp_node`: публичный список пиров, поиск пиров по задержке (сначала разрешённые ключи,
+  потом корень), проброс TCP и UDP, ICMPv6 echo. Необязательные сборки добавляют HTML-сервер
+  статуса (`html`) и пиры `tls://` с поиском в LAN (`upstream-tls`).
 - Поиск пиров **yggdrasil-go** в локальной сети по их беаконам IPv6 link-local
   (`--lan-upstream`), подключение по TLS (необязательная feature `upstream-tls`).
 
@@ -355,9 +366,12 @@ HTML-сервер (сборки `html`) использует один порт, 
 ### Структура репозитория
 
 - `src/` — библиотека (`YggdrasilLite`, формат пакетов, метаданные, сессии).
-- `src/bin/tcp_node.rs` — бинарник устройства.
+- `src/search.rs` — политика поиска пиров (когда и какой пир заменить), покрыта модульными тестами.
+- `src/bin/tcp_node.rs` — бинарник устройства; необязательные части лежат в
+  `src/bin/tcp_node/` (`html`, `discovery`).
 - `examples/` — `lite_node`, `tun` и прошивки ESP32.
-- `tests/` — end-to-end скрипты и тесты транзита.
+- `tests/` — тесты транзита, `peer_search.sh` (поиск пиров от начала до конца) и скрипты yggstack.
+- `scripts/` — `build-variants.sh` (четыре сборки), `termux.sh`, `build.sh`, `fetch-peers.sh`.
 - `openwrt/tcp_node.init` — скрипт службы для OpenWrt.
 
 ### Сборка `tcp_node`
@@ -386,9 +400,14 @@ x86_64, 2,3 МБ против 1,4 МБ для mipsel); сравните кома
 Тесты:
 
 ```sh
-cargo test
-cargo test --features upstream-tls --bin tcp_node upstream_beacon
+cargo test --features transit                       # библиотека, TCP-стек, поиск пиров, транзит
+cargo test --features upstream-tls,html --bin tcp_node # плюс TLS/LAN и HTML-части tcp_node
+tests/peer_search.sh                                # поиск пиров целиком на loopback (~4 мин)
 ```
+
+`tests/peer_search.sh` запускает настоящие узлы, задерживает канал одного пира на 100 мс в
+каждую сторону и проверяет, что узел заменяет этого пира один раз, оценивает замену и не
+метается, если альтернатива так же медленна.
 
 ### Запуск `tcp_node`
 
@@ -407,7 +426,7 @@ cargo test --features upstream-tls --bin tcp_node upstream_beacon
 С параметрами:
 
 ```sh
-./target/release/tcp_node --key ~/ygg.key --target 3 --api 127.0.0.1:8080
+./target/release/tcp_node --key ~/ygg.key --target 3
 ```
 
 Свой список пиров вместо загрузки:
@@ -466,8 +485,8 @@ cargo test --features upstream-tls --bin tcp_node upstream_beacon
 - TLS не проверяет сертификат пира, как и yggdrasil-go. Идентичность пира подтверждается
   подписанным рукопожатием метаданных, которое идёт дальше.
 - Только сети без пароля.
-- TLS берётся из системного OpenSSL, поэтому важна версия OpenSSL на устройстве. Сборка с TLS
-  только подключается к пирам и ничего не слушает.
+- TLS встроен (rustls): ничего не зависит от OpenSSL на устройстве. Сборка с TLS только
+  подключается к пирам и ничего не слушает.
 
 #### Диагностика
 
@@ -490,9 +509,10 @@ cargo build --release --bin tcp_node
 Чтобы узел работал при выключенном экране: `termux-wake-lock`, и отключите оптимизацию
 батареи для Termux в настройках Android.
 
-Дашборд открывается в браузере телефона по адресу `http://127.0.0.1:8080/`, данные в
-Termux — по `http://127.0.0.1:8080/api/stats`. У API нет аутентификации, его нельзя
-привязывать к `0.0.0.0` в общей сети.
+В сборке `html` (`cargo build --release --bin tcp_node --features html` или
+`bash scripts/termux.sh build`) дашборд открывается в браузере телефона по адресу
+`http://127.0.0.1:1080/`, данные в Termux — по `http://127.0.0.1:1080/api/stats`. У API нет
+аутентификации, он слушает только loopback; не переносите его на `0.0.0.0` в общей сети.
 
 ### Проброс TCP-портов (SSH к роутеру или телефону)
 

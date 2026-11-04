@@ -56,8 +56,10 @@ not built in is refused at start. The TLS variants use rustls (no OpenSSL).
 | `--forward PORTS` | TCP port forwarding (up to 16) |
 | `--connect LPORT:[ADDR]:PORT` | Carry connections to 127.0.0.1:LPORT to `[ADDR]:PORT` over Yggdrasil |
 | `--forward-udp PORTS` | UDP port forwarding (up to 16) |
-| `--listen PORT` | Accept incoming TCP peers (up to 16 on top of `--target`); the port is announced in LAN beacons |
-| `--lan` | Find peers on the local network via multicast beacons |
+| `--no-public` | Do not download the public peer list; use `--peers` and LAN discovery only |
+| `--listen PORT` | Accept incoming TCP peers (up to 16 on top of `--target`) |
+| `--lan-upstream` | `upstream-tls` build. Find yggdrasil-go peers on the LAN from their IPv6 link-local beacons (`ff02::114`, port 9001) and dial them over TLS |
+| `--lan-target N` | `upstream-tls` build. Outbound slots reserved for LAN peers (default: `--target`) |
 | `--quality-interval SECS` | Network quality check interval (default 300, minimum 10) |
 | `--ping IPV6` | Measure RTT to a node |
 | `--send IPV6 MSG` | Send a single datagram |
@@ -67,26 +69,27 @@ not built in is refused at start. The TLS variants use rustls (no OpenSSL).
 
 ```sh
 pkg install rust git curl
-bash scripts/termux.sh build     # builds tcp_node
+bash scripts/termux.sh build     # builds tcp_node with the html feature (dashboard)
 bash scripts/termux.sh peers     # downloads the public peers list to ~/peers.json
-bash scripts/termux.sh run       # runs the node with the dashboard on 127.0.0.1:8080
-bash scripts/termux.sh run --lan --listen 40001   # extra flags are passed as-is
+bash scripts/termux.sh run       # runs the node with the dashboard on 127.0.0.1:1080
+bash scripts/termux.sh run --listen 40001   # extra flags are passed as-is
+FEATURES=upstream-tls,html bash scripts/termux.sh build   # tls:// peers and LAN discovery too
 ```
 
 The same manually:
 
 ```sh
 git clone https://github.com/vasil646srb/yggdrasil-lite && cd yggdrasil-lite
-cargo build --release --bin tcp_node
+cargo build --release --bin tcp_node --features html
 
 curl -fsSL -o ~/peers.json https://publicpeers.neilalexander.dev/publicnodes.json
 ./target/release/tcp_node --key ~/ygg.key --peers ~/peers.json \
-    --target 3 --api 127.0.0.1:8080
+    --target 3
 ```
 
-Dashboard: `http://127.0.0.1:8080/` · statistics: `curl http://127.0.0.1:8080/api/stats`.
-The API listens on 127.0.0.1 only and has no authentication — do not expose it
-on 0.0.0.0.
+Dashboard (`html` build): `http://127.0.0.1:1080/` · statistics:
+`curl http://127.0.0.1:1080/api/stats`. The API listens on 127.0.0.1 only and has no
+authentication — do not expose it on 0.0.0.0. The plain build has no dashboard.
 
 The key file is created with mode `600`; if it happens to be readable by other
 users, the node prints a warning. To keep the node alive with the screen off:
@@ -94,12 +97,14 @@ users, the node prints a warning. To keep the node alive with the screen off:
 
 ### Local network and incoming peers
 
-`--lan` enables neighbor discovery on the local network: the node sends
-multicast beacons (magic `YGGL`) to `239.255.42.7:9001` every 3 s and adds the
-found nodes to the candidate list. `--listen PORT` opens the node for incoming
-TCP peers and announces this port in the beacons — so two nodes on the same
-network find each other without public peers. At most 16 incoming connections
-are accepted on top of `--target`.
+`--listen PORT` opens the node for incoming plain-TCP peers (at most 16 on top of
+`--target`), so two nodes can be linked directly without public peers.
+
+In an `upstream-tls` build `--lan-upstream` finds **yggdrasil-go** nodes on the local
+network: it listens (never sends) for their multicast beacons on `ff02::114`, port 9001,
+shares that port with a yggdrasil-go running on the same host, and dials the senders over
+TLS on the interface the beacon came from. See the full description in the README
+(`README.md`, "LAN peers of yggdrasil-go").
 
 ### Automatic peer selection and slow-peer replacement
 
@@ -107,7 +112,7 @@ The node selects peers in two stages so slots are not wasted on unreachable
 addresses:
 
 1. **Probe before dialing.** All candidates from `--peers` (and those found
-   via `--lan`) are checked with a plain TCP connect, in parallel with 8
+   by LAN discovery) are checked with a plain TCP connect, in parallel with 8
    workers, 2 s timeout per address. The result goes into a moving average
    (`record_probe`); an unreachable candidate gets a 5000 ms penalty and
    moves to the end of the queue. While the first round is running, dialing
@@ -253,3 +258,16 @@ scp target/aarch64-unknown-linux-musl/release/tcp_node root@192.168.1.1:/usr/bin
 (no TLS, no C libraries), so cross-compilation needs no extra system
 libraries, and release builds are stripped. Installing the service —
 `openwrt/tcp_node.init` (see comments in the file).
+
+## Tests
+
+```sh
+cargo test --features transit                       # library, TCP stack, peer search, transit
+cargo test --features upstream-tls,html --bin tcp_node # also the TLS/LAN and HTML parts
+tests/peer_search.sh                                # peer search end to end on loopback (~4 min)
+```
+
+`tests/peer_search.sh` starts real nodes on loopback (two transit hubs, a leaf with the allowed
+key, and the node under test), delays the first peer's link by 100 ms each way and checks that the
+node replaces that peer once, judges the replacement (helpful when the other peer is fast, not
+helpful with a backoff when it is just as slow), and does not churn.
