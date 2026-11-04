@@ -255,7 +255,9 @@ YGGSTACK_BIN=/path/to/yggstack bash tests/e2e.sh
 - Verified: the library and `tcp_node` build on Termux; LAN connections to a yggdrasil-go
   peer work, and stay up while internet peers are connected. These results were obtained
   with an earlier rustls-based TLS. The current rustls build was tested against a local TLS
-  terminator (10 MiB through the tunnel); it has not been run against yggdrasil-go itself.
+  terminator (10 MiB through the tunnel) and, on an OpenWrt 24.10 router (MT7628, mipsel,
+  no FPU), connected to live `tls://` peers running yggdrasil-go. LAN beacon discovery has
+  not been run against a real yggdrasil-go beacon.
 - Open: a LAN-only connection (no internet peers) was reported to drop after 2–3 seconds.
   Cause not yet confirmed.
 - Not verified: TLS 1.2 negotiation with yggdrasil-go; the announce feature was removed.
@@ -517,7 +519,9 @@ YGGSTACK_BIN=/path/to/yggstack bash tests/e2e.sh
 - Проверено: библиотека и `tcp_node` собираются в Termux; LAN-соединения с пиром yggdrasil-go
   работают и держатся, пока подключены интернет-пиры. Эти результаты получены на прежней
   TLS-реализации на rustls. Текущая сборка на rustls проверена с локальным TLS-терминатором
-  (10 МиБ через туннель); с самим yggdrasil-go она не запускалась.
+  (10 МиБ через туннель) и на роутере с OpenWrt 24.10 (MT7628, mipsel, без FPU), где
+  подключилась к настоящим `tls://`-пирам на yggdrasil-go. Поиск пиров по маякам в LAN с
+  настоящим маяком yggdrasil-go не проверялся.
 - Открыто: соединение только с LAN-пирами (без интернет-пиров) сообщалось как падающее через
   2–3 секунды. Причина пока не подтверждена.
 - Не проверено: согласование TLS 1.2 с yggdrasil-go. Режим анонса удалён из кода.
