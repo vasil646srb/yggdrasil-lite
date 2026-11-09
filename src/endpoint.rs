@@ -132,6 +132,8 @@ pub struct Endpoint {
     /// Keys allowed to deliver datagrams to this device (set at provisioning).
     /// Empty by default: the device accepts nothing until a key is configured.
     allowed: Vec<PublicKey>,
+    /// Overlay TCP ports open to every key (public services); other ports still need an allowed key.
+    open_ports: Vec<u16>,
     /// Answer ICMPv6 echo requests from allowed keys (default on).
     ping_replies: bool,
     /// Accept `tls://` candidates (the platform can dial TLS). Default off.
@@ -226,6 +228,7 @@ impl Endpoint {
             inbox: VecDeque::new(),
             pending: VecDeque::new(),
             allowed: Vec::new(),
+            open_ports: Vec::new(),
             ping_replies: true,
             tls_peers: false,
             outbox: VecDeque::new(),
@@ -457,6 +460,19 @@ impl Endpoint {
         if !self.allowed.contains(&key) {
             self.allowed.push(key);
         }
+    }
+
+    /// Accept TCP on `port` from any key (a public service). The source address must still belong to
+    /// the sender's key, so the application can trust it as the caller's identity.
+    pub fn open_port(&mut self, port: u16) {
+        if !self.open_ports.contains(&port) {
+            self.open_ports.push(port);
+        }
+    }
+
+    /// Limits of the TCP stack (connections, buffers). Call before traffic starts.
+    pub fn tcp_config_mut(&mut self) -> &mut TcpConfig {
+        self.tcp.config_mut()
     }
 
     pub fn is_allowed(&self, key: &PublicKey) -> bool {
@@ -864,7 +880,7 @@ impl Endpoint {
         if seg.src != address::addr_for_key(source).0 {
             return;
         }
-        if !self.allowed.contains(source) && !self.tcp.has_connection(seg) {
+        if !self.allowed.contains(source) && !self.open_ports.contains(&seg.dport) && !self.tcp.has_connection(seg) {
             return;
         }
         self.tcp.handle_segment(seg, self.last_now_ms);
@@ -1290,6 +1306,28 @@ mod tests {
         assert_eq!(net.eps[1].tcp_connections().len(), 0);
         assert!(net.eps[0].tcp_event().is_none(), "A is still trying, no RST came back");
         net.eps[0].tcp_abort(id);
+    }
+
+    #[test]
+    fn tcp_on_open_port_is_accepted_from_any_key() {
+        let mut rng = OsRng;
+        let mut net = Net::new();
+        // B allows nobody, but port 8787 is a public service; port 22 stays closed.
+        net.eps[1].tcp_listen(8787);
+        net.eps[1].tcp_listen(22);
+        net.eps[1].open_port(8787);
+        net.run(30, &mut rng);
+        let b_addr = net.eps[1].address();
+        let closed = net.eps[0].tcp_connect(&b_addr, 22).unwrap();
+        let _open = net.eps[0].tcp_connect(&b_addr, 8787).unwrap();
+        net.run(80, &mut rng);
+        let conns = net.eps[1].tcp_connections();
+        assert_eq!(conns.len(), 1, "only the open port accepts");
+        // the accepted connection carries A's real address: the application may use it as identity
+        let a_addr = net.eps[0].address();
+        let id = conns[0].id;
+        assert_eq!(net.eps[1].tcp_remote(id).map(|(a, _)| a), Some(a_addr));
+        net.eps[0].tcp_abort(closed);
     }
 
     #[test]
