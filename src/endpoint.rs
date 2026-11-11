@@ -87,6 +87,8 @@ pub struct PeerInfo {
     pub up_ms: u64,
     /// Outbound peer found by LAN discovery.
     pub lan: bool,
+    /// Transport slot of this peer (the slot of `Action::Write`/`on_bytes`).
+    pub slot: SlotId,
 }
 
 /// An application datagram delivered to this device.
@@ -115,6 +117,22 @@ struct Pending {
     dest: [u8; 16],
     data: Vec<u8>,
     queued_ms: u64,
+    /// Sent with [`Endpoint::send_packet`]: remember the key once it resolves.
+    contact: bool,
+}
+
+/// Most keys remembered by [`Endpoint::send_packet`] (oldest forgotten first).
+const CONTACTED_CAP: usize = 256;
+
+/// Partial key to look up the owner of a node address (`200::/8`) or subnet (`300::/8`).
+fn partial_key(dest: &[u8; 16]) -> [u8; 32] {
+    if dest[0] == 0x03 {
+        let mut prefix = [0u8; 8];
+        prefix.copy_from_slice(&dest[..8]);
+        address::Subnet(prefix).get_key()
+    } else {
+        Address(*dest).get_key()
+    }
 }
 
 /// Yggdrasil leaf endpoint for a device. See the module docs.
@@ -128,12 +146,20 @@ pub struct Endpoint {
     /// accepted inbound connections.
     conns: Vec<Option<Conn>>,
     inbox: VecDeque<Received>,
+    /// Inbox length before the oldest datagram is dropped (`set_inbox_cap`).
+    inbox_cap: usize,
+    /// Keys we sent packets to with [`send_packet`](Self::send_packet) (a TUN bridge): their
+    /// replies are delivered like an allowed key's, TCP included (not to our own stack).
+    contacted: VecDeque<PublicKey>,
     pending: VecDeque<Pending>,
     /// Keys allowed to deliver datagrams to this device (set at provisioning).
     /// Empty by default: the device accepts nothing until a key is configured.
     allowed: Vec<PublicKey>,
     /// Answer ICMPv6 echo requests from allowed keys (default on).
     ping_replies: bool,
+    /// Also answer echo requests from keys that are not allowed (public services, so clients
+    /// can measure the path to us). Default off.
+    ping_any: bool,
     /// Accept `tls://` candidates (the platform can dial TLS). Default off.
     tls_peers: bool,
     /// Echo replies waiting to be sent: (destination key, IPv6 packet).
@@ -142,6 +168,8 @@ pub struct Endpoint {
     tcp: TcpStack,
     /// Ports the application listens on (its connections are reported through `tcp_event`).
     tcp_ports: Vec<u16>,
+    /// Listening ports that accept TCP from any key, not only allowed ones (`tcp_listen_open`).
+    open_ports: Vec<u16>,
     /// TCP events for the application.
     tcp_events: VecDeque<tcp_stack::Event>,
     /// TCP packets waiting to be sent: (destination address, framed IPv6 packet).
@@ -224,13 +252,17 @@ impl Endpoint {
             pool: PeerPool::with_lan_slots(target_outbound, lan_slots),
             conns: (0..target_outbound + lan_slots).map(|_| None).collect(),
             inbox: VecDeque::new(),
+            inbox_cap: INBOX_CAP,
+            contacted: VecDeque::new(),
             pending: VecDeque::new(),
             allowed: Vec::new(),
             ping_replies: true,
+            ping_any: false,
             tls_peers: false,
             outbox: VecDeque::new(),
             tcp,
             tcp_ports: Vec::new(),
+            open_ports: Vec::new(),
             tcp_events: VecDeque::new(),
             tcp_out: VecDeque::new(),
             http: None,
@@ -262,6 +294,11 @@ impl Endpoint {
     }
 
     /// Enable or disable automatic replies to ICMPv6 echo requests.
+    /// Answer echo requests from any key, not only allowed ones (see `ping_any`).
+    pub fn set_ping_any(&mut self, on: bool) {
+        self.ping_any = on;
+    }
+
     pub fn set_ping_replies(&mut self, on: bool) {
         self.ping_replies = on;
     }
@@ -329,9 +366,19 @@ impl Endpoint {
         self.tcp.listen(port);
     }
 
+    /// Accept TCP connections on overlay `port` from any Yggdrasil node, allowed or
+    /// not. Other ports, ping and datagrams still need an allowed key.
+    pub fn tcp_listen_open(&mut self, port: u16) {
+        self.tcp_listen(port);
+        if !self.open_ports.contains(&port) {
+            self.open_ports.push(port);
+        }
+    }
+
     /// Stop accepting connections on `port` (open ones stay).
     pub fn tcp_unlisten(&mut self, port: u16) {
         self.tcp_ports.retain(|p| *p != port);
+        self.open_ports.retain(|p| *p != port);
         if !(port == self.http_port && self.http.is_some()) {
             self.tcp.unlisten(port);
         }
@@ -536,6 +583,7 @@ impl Endpoint {
                     rtt_ms,
                     up_ms: c.up_ms,
                     lan: c.outbound && self.pool.slot_is_lan(slot),
+                    slot,
                 })
             })
             .collect();
@@ -769,17 +817,7 @@ impl Endpoint {
         if let Some(key) = self.node.resolve(&dest.0) {
             return self.send_to_key(&key, data, now_ms, rng);
         }
-        if self.pending.len() >= PENDING_CAP {
-            self.pending.pop_front();
-        }
-        self.pending.push_back(Pending {
-            dest: dest.0,
-            data: data.to_vec(),
-            queued_ms: now_ms,
-        });
-        let partial = dest.get_key();
-        let events = self.node.lookup(&partial, now_ms);
-        self.events_to_actions(events)
+        self.queue_pending(dest.0, data, now_ms, false)
     }
 
     /// Send `data` to a node by its full public key.
@@ -798,6 +836,43 @@ impl Endpoint {
     /// Next datagram addressed to this device, if any.
     pub fn recv(&mut self) -> Option<Received> {
         self.inbox.pop_front()
+    }
+
+    /// Inbox length before the oldest datagram is dropped (default 16). A TUN bridge wants
+    /// more: one read from a peer can carry dozens of packets.
+    pub fn set_inbox_cap(&mut self, cap: usize) {
+        self.inbox_cap = cap.max(1);
+    }
+
+    /// Send an IPv6 packet from a TUN bridge to a node address (`200::/8`) or a node's subnet
+    /// (`300::/8`, e.g. a NAT64 pool). Like [`send_to_address`](Self::send_to_address), and the
+    /// destination's key is remembered so its replies reach [`recv`](Self::recv) (stateful,
+    /// like a firewall: nodes we never wrote to stay filtered).
+    pub fn send_packet(&mut self, dest: &[u8; 16], data: &[u8], now_ms: u64, rng: &mut impl CryptoRngCore) -> Vec<Action> {
+        if let Some(key) = self.node.resolve(dest) {
+            self.remember_contact(key);
+            return self.send_to_key(&key, data, now_ms, rng);
+        }
+        self.queue_pending(*dest, data, now_ms, true)
+    }
+
+    fn remember_contact(&mut self, key: PublicKey) {
+        if self.contacted.front() == Some(&key) || self.contacted.contains(&key) {
+            return;
+        }
+        if self.contacted.len() >= CONTACTED_CAP {
+            self.contacted.pop_back();
+        }
+        self.contacted.push_front(key);
+    }
+
+    fn queue_pending(&mut self, dest: [u8; 16], data: &[u8], now_ms: u64, contact: bool) -> Vec<Action> {
+        if self.pending.len() >= PENDING_CAP {
+            self.pending.pop_front();
+        }
+        self.pending.push_back(Pending { dest, data: data.to_vec(), queued_ms: now_ms, contact });
+        let events = self.node.lookup(&partial_key(&dest), now_ms);
+        self.events_to_actions(events)
     }
 
     // -----------------------------------------------------------------------
@@ -858,17 +933,26 @@ impl Endpoint {
     }
 
     /// Hand a TCP segment addressed to us to the stack. It must come from the
-    /// key that owns its source address, and either from an allowed key or on
-    /// a connection we opened.
+    /// key that owns its source address, and either from an allowed key, to a
+    /// port opened with [`tcp_listen_open`](Self::tcp_listen_open), or on a
+    /// connection we opened.
     fn tcp_input(&mut self, source: &PublicKey, seg: &tcp::Segment) {
         if seg.src != address::addr_for_key(source).0 {
             return;
         }
-        if !self.allowed.contains(source) && !self.tcp.has_connection(seg) {
+        if !self.allowed.contains(source)
+            && !self.open_ports.contains(&seg.dport)
+            && !self.tcp.has_connection(seg)
+        {
             return;
         }
         self.tcp.handle_segment(seg, self.last_now_ms);
         self.after_tcp();
+    }
+
+    fn is_echo_request_to_us(&self, data: &[u8]) -> bool {
+        icmp::parse_echo(unframe_ipv6(data))
+            .map_or(false, |echo| echo.kind == ECHO_REQUEST && echo.dst == self.address().0)
     }
 
     fn is_echo_reply_to_us(&self, data: &[u8]) -> bool {
@@ -905,16 +989,23 @@ impl Endpoint {
                 NodeEvent::Deliver { source, data } => {
                     let our = self.node.address().0;
                     let ip = unframe_ipv6(&data);
-                    // TCP to our address goes to the stack (which checks keys itself).
+                    let contacted = self.contacted.contains(&source);
+                    // TCP to our address goes to the stack (which checks keys itself), except
+                    // a TUN bridge's own connections to nodes it wrote to.
                     if let Some(seg) = tcp::parse(ip) {
-                        if seg.dst == our {
+                        if seg.dst == our && !(contacted && !self.tcp.has_connection(&seg)) {
                             self.tcp_input(&source, &seg);
                             continue;
                         }
                     }
                     // Echo replies are accepted from any peer: they can only answer
-                    // our own `ping_key` requests. Everything else needs an allowed key.
-                    if !self.allowed.contains(&source) && !self.is_echo_reply_to_us(&data) {
+                    // our own `ping_key` requests. Echo requests pass from anyone with
+                    // `ping_any`. Everything else needs an allowed key.
+                    if !self.allowed.contains(&source)
+                        && !contacted
+                        && !self.is_echo_reply_to_us(&data)
+                        && !(self.ping_any && self.is_echo_request_to_us(&data))
+                    {
                         continue;
                     }
                     if let Some(echo) = icmp::parse_echo(ip) {
@@ -933,7 +1024,7 @@ impl Endpoint {
                             continue;
                         }
                     }
-                    if self.inbox.len() >= INBOX_CAP {
+                    if self.inbox.len() >= self.inbox_cap {
                         self.inbox.pop_front();
                     }
                     self.inbox.push_back(Received {
@@ -955,9 +1046,12 @@ impl Endpoint {
                 continue;
             }
             if let Some(key) = self.node.resolve(&p.dest) {
+                if p.contact {
+                    self.remember_contact(key);
+                }
                 actions.extend(self.send_to_key(&key, &p.data, now_ms, rng));
             } else {
-                let partial = Address(p.dest).get_key();
+                let partial = partial_key(&p.dest);
                 let events = self.node.lookup(&partial, now_ms);
                 actions.extend(self.events_to_actions(events));
                 self.pending.push_back(p);
@@ -986,6 +1080,7 @@ mod tests {
     use rand::rngs::OsRng;
     use rand::RngCore;
     use std::collections::{HashMap, VecDeque as Queue};
+    use crate::udp;
 
     fn seed() -> [u8; 32] {
         let mut s = [0u8; 32];
@@ -1290,6 +1385,114 @@ mod tests {
         assert_eq!(net.eps[1].tcp_connections().len(), 0);
         assert!(net.eps[0].tcp_event().is_none(), "A is still trying, no RST came back");
         net.eps[0].tcp_abort(id);
+    }
+
+    /// A TUN bridge reaches a node's subnet (`300::/8`, e.g. a NAT64 pool) with `send_packet`,
+    /// and that node's replies come back although it is not allowed; others stay filtered.
+    #[test]
+    fn send_packet_reaches_a_subnet_and_lets_its_replies_in() {
+        let mut rng = OsRng;
+        let mut net = Net::new();
+        let a_key = *net.eps[0].public_key();
+        let b_key = *net.eps[1].public_key();
+        net.eps[1].set_allowed_keys(vec![a_key]);
+        net.run(30, &mut rng);
+        let a_addr = net.eps[0].address().0;
+        let mut pool = [0u8; 16];
+        pool[..8].copy_from_slice(&address::subnet_for_key(&b_key).0);
+        pool[15] = 7; // 3xx:…::7, an address in B's /64
+
+        // Before A writes to B, B's datagrams to A are dropped (A allows nobody).
+        let early = udp::build(net.eps[1].address().0, a_addr, 53, 4000, b"early");
+        let acts = net.eps[1].send_to_address(&Address(a_addr), &frame_ipv6(&early), net.now, &mut rng);
+        net.submit(1, acts, &mut rng);
+        assert!(net.wait_recv(0, &mut rng, 100).is_none(), "unsolicited datagram is filtered");
+
+        let pkt = udp::build(a_addr, pool, 4000, 53, b"query");
+        let acts = net.eps[0].send_packet(&pool, &frame_ipv6(&pkt), net.now, &mut rng);
+        net.submit(0, acts, &mut rng);
+        let got = net.wait_recv(1, &mut rng, 200).expect("B gets the packet for its subnet");
+        assert_eq!(got.from_key, a_key);
+        let dg = udp::parse(unframe_ipv6(&got.data)).expect("udp");
+        assert_eq!((dg.dst, dg.payload.as_slice()), (pool, &b"query"[..]));
+
+        // The reply comes from the pool address, owned by B's key: A lets it in now.
+        let reply = udp::build(pool, a_addr, 53, 4000, b"answer");
+        let acts = net.eps[1].send_to_address(&Address(a_addr), &frame_ipv6(&reply), net.now, &mut rng);
+        net.submit(1, acts, &mut rng);
+        let back = net.wait_recv(0, &mut rng, 200).expect("reply from a contacted key");
+        assert_eq!(back.from_key, b_key);
+        assert_eq!(udp::parse(unframe_ipv6(&back.data)).unwrap().payload, b"answer");
+    }
+
+    /// `ping_any` answers echo requests from keys that are not allowed; without it they are dropped.
+    #[test]
+    fn ping_any_answers_unallowed_keys() {
+        let mut rng = OsRng;
+        for open in [false, true] {
+            let mut net = Net::new();
+            let b_key = *net.eps[1].public_key();
+            net.eps[1].set_ping_any(open); // B allows nobody
+            net.run(30, &mut rng);
+            let acts = net.eps[0].ping_key(&b_key, 0x5155, 9, net.now, &mut rng);
+            net.submit(0, acts, &mut rng);
+            let reply = net.wait_recv(0, &mut rng, 200);
+            assert_eq!(reply.is_some(), open, "ping_any={open}");
+            if let Some(r) = reply {
+                let echo = icmp::parse_echo(unframe_ipv6(&r.data)).expect("echo");
+                assert_eq!((echo.kind, echo.seq), (ECHO_REPLY, 9));
+            }
+        }
+    }
+
+    /// An open port accepts any key; the other ports still need an allowed key.
+    #[test]
+    fn open_port_accepts_keys_that_are_not_allowed() {
+        let mut rng = OsRng;
+        let mut net = Net::new();
+        net.eps[1].tcp_listen_open(1080);
+        net.eps[1].tcp_listen(22);
+        net.run(30, &mut rng);
+        let b_addr = net.eps[1].address();
+
+        let closed = net.eps[0].tcp_connect(&b_addr, 22).unwrap();
+        let id = net.eps[0].tcp_connect(&b_addr, 1080).unwrap();
+        let mut accepted = None;
+        let mut connected = false;
+        assert!(run_until(&mut net, &mut rng, 300, |net| {
+            while let Some(ev) = net.eps[1].tcp_event() {
+                if let tcp_stack::Event::Accepted { id, port } = ev {
+                    assert_eq!(port, 1080, "only the open port accepts");
+                    accepted = Some(id);
+                }
+            }
+            while let Some(ev) = net.eps[0].tcp_event() {
+                if ev == (tcp_stack::Event::Connected { id }) {
+                    connected = true;
+                }
+            }
+            accepted.is_some() && connected
+        }), "connection to the open port is established");
+
+        // Data flows both ways on the accepted connection.
+        let bid = accepted.unwrap();
+        net.eps[0].tcp_write(id, b"ping");
+        let mut buf = [0u8; 16];
+        let mut got = Vec::new();
+        assert!(run_until(&mut net, &mut rng, 300, |net| {
+            let n = net.eps[1].tcp_read(bid, &mut buf);
+            got.extend_from_slice(&buf[..n]);
+            got == b"ping"
+        }));
+        net.eps[1].tcp_write(bid, b"pong");
+        got.clear();
+        assert!(run_until(&mut net, &mut rng, 300, |net| {
+            let n = net.eps[0].tcp_read(id, &mut buf);
+            got.extend_from_slice(&buf[..n]);
+            got == b"pong"
+        }));
+        assert_eq!(net.eps[1].tcp_connections().len(), 1, "port 22 stayed closed");
+        net.eps[0].tcp_abort(closed);
     }
 
     #[test]

@@ -54,6 +54,8 @@ not built in is refused at start. The TLS variants use rustls (no OpenSSL).
 | `--html FILE` | `html` build. Custom HTML page for the node page |
 | `--html-port PORT` | `html` build. Overlay port of the page and port of the local dashboard (default 1080) |
 | `--forward PORTS` | TCP port forwarding (up to 16) |
+| `--open PORTS` | Forwarded ports (and ping) open to any key, not only `--allow` |
+| `--rtt-limit MS` | Replace peers while the latency to `--allow` keys or `--connect` servers exceeds this (default 150) |
 | `--connect LPORT:[ADDR]:PORT` | Carry connections to 127.0.0.1:LPORT to `[ADDR]:PORT` over Yggdrasil |
 | `--forward-udp PORTS` | UDP port forwarding (up to 16) |
 | `--no-public` | Do not download the public peer list; use `--peers` and LAN discovery only |

@@ -5,7 +5,8 @@
 //!
 //! The pages share one port number, `--html-port` (default 1080): the status page is served on
 //! that overlay TCP port to allowed keys, and the dashboard (`GET /`, `GET /api/stats`) on
-//! `127.0.0.1:<port>` unless `--api ADDR` says otherwise (`--api off` disables it). The
+//! `127.0.0.1:<port>` unless `--api ADDR` says otherwise (`--api off` disables it);
+//! `GET /api/peers` lists the connected peers with their traffic. The
 //! dashboard is loopback only and has no authentication.
 
 #[cfg(feature = "html")]
@@ -29,5 +30,7 @@ mod stub {
         }
 
         pub(crate) fn refresh(&self, _ep: &mut Endpoint, _q: &Quality, _o: &OverlayInfo, _slots: usize, _now: u64) {}
+
+        pub(crate) fn set_peers(&self, _json: String) {}
     }
 }

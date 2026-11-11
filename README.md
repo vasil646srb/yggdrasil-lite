@@ -143,6 +143,10 @@ address, so keep it private.
 | `--target N` | Outbound peers to keep connected (1..=32, default 3). |
 | `--allow KEY` | Allow an overlay key to use forwards, ping and the page. Repeatable. |
 | `--forward PORTS` | Expose local TCP ports over Yggdrasil, e.g. `22,2222:22`. Up to 16 ports. |
+| `--open PORTS` | Let any overlay key use these `--forward` ports and ping the node (a public service), e.g. `1080`. The page stays `--allow`-only. |
+| `--swap-interval SECS` | At least this long between two peer replacements (default 30; doubles after a useless one, up to 10 min). |
+| `--swap-settle SECS` | How long a new peer is measured before the replacement is judged (default 60). |
+| `--rtt-limit MS` | Replace peers while the latency to the `--allow` keys or the `--connect` servers is above this (default 150). A client with `--connect` searches for peers that give the lowest ping to its server. |
 | `--connect LPORT:[ADDR]:PORT` | Listen on 127.0.0.1:LPORT and carry each connection to `[ADDR]:PORT` over Yggdrasil. Repeatable. |
 | `--api ADDR\|off` | `html` build. Local dashboard and `/api/stats`, default `127.0.0.1:<html-port>`. No authentication: loopback only. |
 | `--html FILE` | `html` build. Replace the default page on the overlay HTML port. |
@@ -448,6 +452,10 @@ tests/peer_search.sh                                # поиск пиров це
 | `--target N` | Сколько исходящих пиров держать (1..=32, по умолчанию 3). |
 | `--allow KEY` | Разрешить ключу оверлея пользоваться проброской, ping и страницей. Можно несколько раз. |
 | `--forward PORTS` | Открыть локальные TCP-порты через Yggdrasil, например `22,2222:22`. До 16 портов. |
+| `--open PORTS` | Пустить к этим портам `--forward` и к ping любой ключ оверлея (публичный сервис), например `1080`. Страница — только `--allow`. |
+| `--swap-interval SECS` | Не чаще одной замены пира за это время (по умолчанию 30; после бесполезной замены вдвое дольше, до 10 мин). |
+| `--swap-settle SECS` | Сколько мерить нового пира, прежде чем решить, помогла ли замена (по умолчанию 60). |
+| `--rtt-limit MS` | Менять пиров, пока пинг до ключей `--allow` или серверов `--connect` выше этого (по умолчанию 150). Клиент с `--connect` ищет пиров с наименьшим пингом до сервера. |
 | `--connect LPORT:[ADDR]:PORT` | Слушать 127.0.0.1:LPORT и передавать каждое соединение на `[ADDR]:PORT` через Yggdrasil. Можно повторять. |
 | `--api ADDR\|off` | Сборка `html`. Локальная панель и `/api/stats`, по умолчанию `127.0.0.1:<html-port>`. Без аутентификации: только loopback. |
 | `--html FILE` | Сборка `html`. Заменить страницу по умолчанию на HTML-порту оверлея. |
