@@ -27,7 +27,7 @@ use crate::crypto::PublicKey;
 /// Latency to the root above this (ms) is slow.
 pub const ROOT_LIMIT_MS: u64 = 200;
 /// Latency to an allowed client above this (ms) is slow.
-pub const CLIENT_LIMIT_MS: u64 = 150;
+pub const CLIENT_LIMIT_MS: u64 = 250;
 
 /// Smoothing: `new = (old * (DIV - 1) + sample) / DIV`.
 const EWMA_DIV: u64 = 4;
@@ -300,7 +300,7 @@ mod tests {
 
     /// Config for tests that feed single samples.
     fn one_sample() -> SearchConfig {
-        SearchConfig { min_samples: 1, warmup: 0, ..SearchConfig::default() }
+        SearchConfig { min_samples: 1, warmup: 0, client_limit_ms: 150, ..SearchConfig::default() }
     }
 
     fn key(n: u8) -> PublicKey {
@@ -466,7 +466,7 @@ mod tests {
 
     #[test]
     fn the_first_echo_is_thrown_away() {
-        let mut s = PeerSearch::new(SearchConfig::default());
+        let mut s = PeerSearch::new(SearchConfig { client_limit_ms: 150, ..SearchConfig::default() });
         // Path discovery and the handshake inflate the first echo to seconds.
         s.record_client(&key(9), 6_500, 1_000);
         assert_eq!(s.metric(2_000), None, "a single sample never counts");
@@ -487,7 +487,7 @@ mod tests {
 
     #[test]
     fn a_cold_start_does_not_fake_a_slow_path_or_a_baseline() {
-        let mut s = PeerSearch::new(SearchConfig::default());
+        let mut s = PeerSearch::new(SearchConfig { client_limit_ms: 150, ..SearchConfig::default() });
         // Real round trip 200 ms (over the 150 ms limit); the first echo took 6.5 s.
         s.record_client(&key(9), 6_500, 1_000);
         s.record_client(&key(9), 200, 11_000);

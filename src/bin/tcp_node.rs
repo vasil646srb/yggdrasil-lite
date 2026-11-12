@@ -139,6 +139,10 @@ const ALLOW_PROBE_SEQ: u16 = 3;
 const TARGET_PROBE_SEQ: u16 = 4;
 /// Echo `seq` for a `--monitor-file` address (display only, no effect on the peer search).
 const MONITOR_PROBE_SEQ: u16 = 5;
+/// Echo to a `--search-file` address (a tracker): drives the peer search while no server is set.
+const SEARCH_PROBE_SEQ: u16 = 7;
+/// The peer search's slot for the averaged `--search-file` latency (not a real key).
+const SEARCH_KEY: PublicKey = [0xee; 32];
 /// Echo `seq` for the root's latency shown by `/api/rtt` (display only).
 const ROOT_MON_SEQ: u16 = 6;
 /// Print the latency to each `--connect` server every this many probes.
@@ -418,6 +422,10 @@ struct Args {
     /// before any other candidate, and every 2 min a connected peer outside the list (or far
     /// down it) gives way to a better listed one that is free.
     prefer_file: Option<String>,
+    /// `--search-file PATH`: addresses (one per line, re-read live), e.g. the trackers. While no
+    /// --connect/--connect-file server is set, their averaged ping drives the peer search
+    /// instead of the ping to the root; with a server, the server's ping decides.
+    search_file: Option<String>,
     /// `--fwmark N`: SO_MARK on peer connections (Linux).
     fwmark: u32,
     /// `--swap-interval SECS` / `--swap-settle SECS`: peer search timing (see SearchConfig).
@@ -470,6 +478,8 @@ downloads the public peer list and connects.
                             to the --connect servers is above this (default 150)
   --socks ADDR              local SOCKS5 (no auth, CONNECT) into Yggdrasil: any [200::/7]:port,
                             e.g. 127.0.0.1:10810 (loopback only)
+  --search-file PATH        addresses (e.g. trackers) whose averaged ping drives the peer
+                            search while no server is set (instead of the root), re-read live
   --prefer-file PATH        peer URIs, best first, re-read live: dialed first, and a better
                             listed peer replaces an unlisted one every 2 min
   --connect-file LPORT:PATH  like --connect, the server ([IPV6]:PORT) read live from PATH:
@@ -517,7 +527,7 @@ fn parse_connect(spec: &str) -> Result<(u16, Ipv6Addr, u16), String> {
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { key: None, connects: Vec::new(), peers: None, allow: Vec::new(), target: 3, send: None, ping: None, html: None, api: None, html_port: HTML_PORT, quality_ms: DEFAULT_RECHECK_MS, forwards: Vec::new(), open: Vec::new(), proxy_ports: Vec::new(), rtt_limit: CLIENT_RTT_LIMIT_MS, tun: None, tun_ctl: None, tun_server: None, swap_interval: None, swap_settle: None, fwmark: 0, monitor_file: None, connect_file: None, prefer_file: None, socks: None, forwards_udp: Vec::new(), send_udp: None, lan_upstream: false, no_public: false, listen: None, lan_target: None };
+    let mut a = Args { key: None, connects: Vec::new(), peers: None, allow: Vec::new(), target: 3, send: None, ping: None, html: None, api: None, html_port: HTML_PORT, quality_ms: DEFAULT_RECHECK_MS, forwards: Vec::new(), open: Vec::new(), proxy_ports: Vec::new(), rtt_limit: CLIENT_RTT_LIMIT_MS, tun: None, tun_ctl: None, tun_server: None, swap_interval: None, swap_settle: None, fwmark: 0, monitor_file: None, connect_file: None, prefer_file: None, search_file: None, socks: None, forwards_udp: Vec::new(), send_udp: None, lan_upstream: false, no_public: false, listen: None, lan_target: None };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         match flag.as_str() {
@@ -586,6 +596,7 @@ fn parse_args() -> Args {
             "--socks" => a.socks = Some(it.next().unwrap_or_else(|| usage())),
             "--monitor-file" => a.monitor_file = Some(it.next().unwrap_or_else(|| usage())),
             "--prefer-file" => a.prefer_file = Some(it.next().unwrap_or_else(|| usage())),
+            "--search-file" => a.search_file = Some(it.next().unwrap_or_else(|| usage())),
             "--connect-file" => {
                 let spec = it.next().unwrap_or_else(|| usage());
                 let (p, path) = spec.split_once(':').unwrap_or_else(|| usage());
@@ -1437,6 +1448,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         None => None,
     };
+    let mut search_targets: Vec<[u8; 16]> = Vec::new();
+    let mut search_text: Option<String> = None;
+    let mut search_sent: HashMap<[u8; 16], (u64, ProbeNonce)> = HashMap::new();
     let mut prefer_text: Option<String> = None;
     let mut last_prefer_read = Instant::now() - Duration::from_secs(60);
     let mut last_upgrade = Instant::now();
@@ -1769,6 +1783,20 @@ fn main() -> Result<(), Box<dyn Error>> {
                                     if target_rounds % TARGET_REPORT_EVERY == 1 {
                                         let avg = finder.client_rtt(rx).map(|v| format!("{v} ms")).unwrap_or("-".into());
                                         println!("server rtt:     [{}] {sample} ms (avg {avg}, limit {} ms)", Ipv6Addr::from(a), args.rtt_limit);
+                                    }
+                                }
+                            }
+                        }
+                        SEARCH_PROBE_SEQ => {
+                            let a = addr_for_key(&msg.from_key).0;
+                            if let Some((sent, nonce)) = search_sent.get(&a).copied() {
+                                if nonce.as_slice() == echo.payload.as_slice() {
+                                    search_sent.remove(&a);
+                                    let sample = rx.saturating_sub(sent);
+                                    rtts.entry(a).or_default().record(sample, rx);
+                                    // Only without a server: then the server's ping decides.
+                                    if targets.is_empty() {
+                                        finder.record_client(&SEARCH_KEY, sample, rx);
                                     }
                                 }
                             }
@@ -2123,6 +2151,26 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let acts = ep.ping_payload(&Address(*a), QUALITY_ID, TARGET_PROBE_SEQ, &nonce, now, &mut rng);
                 target_sent.insert(*a, (clock(start), nonce)); // stamped right before the write
                 run(acts, &mut ep, &mut streams, &mut dialer, now);
+            }
+            // --search-file: without a server, the ping to these (the trackers) decides.
+            if let Some(path) = &args.search_file {
+                let text = std::fs::read_to_string(path).unwrap_or_default();
+                if search_text.as_deref() != Some(text.as_str()) {
+                    search_targets = text.lines().filter_map(|l| l.trim().trim_matches(|c| c == '[' || c == ']').parse::<Ipv6Addr>().ok()).map(|a| a.octets()).collect();
+                    println!("search:         peer search by ping to {} addresses while no server is set", search_targets.len());
+                    finder.forget_client(&SEARCH_KEY);
+                    search_text = Some(text);
+                }
+                if targets.is_empty() {
+                    for a in &search_targets {
+                        let nonce = new_nonce(&mut rng);
+                        let acts = ep.ping_payload(&Address(*a), QUALITY_ID, SEARCH_PROBE_SEQ, &nonce, now, &mut rng);
+                        search_sent.insert(*a, (clock(start), nonce));
+                        run(acts, &mut ep, &mut streams, &mut dialer, now);
+                    }
+                } else {
+                    finder.forget_client(&SEARCH_KEY);
+                }
             }
         }
 
