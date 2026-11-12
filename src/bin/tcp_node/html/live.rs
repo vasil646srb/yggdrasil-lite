@@ -9,6 +9,8 @@ pub(crate) struct Html {
     shared: Arc<Mutex<NetState>>,
     /// `/api/peers` body, rebuilt by the main loop about once a second.
     peers: Arc<Mutex<String>>,
+    /// `/api/rtt` body (monitored servers and root latency).
+    rtt: Arc<Mutex<String>>,
     /// The local dashboard is running.
     api: bool,
     /// The user gave `--html FILE`: the live overlay page is not generated.
@@ -33,9 +35,10 @@ impl Html {
 
         let shared: Arc<Mutex<NetState>> = Arc::new(Mutex::new(NetState::new()));
         let peers: Arc<Mutex<String>> = Arc::new(Mutex::new("{\"peers\":[]}".to_string()));
+        let rtt: Arc<Mutex<String>> = Arc::new(Mutex::new("{\"servers\":[],\"root\":null}".to_string()));
         // An explicit address must work; the default one may be taken (a SOCKS proxy on 1080).
         let (addr, explicit) = match args.api.as_deref() {
-            Some("off") => return Ok(Html { shared, peers, api: false, custom_page: args.html.is_some(), port: args.html_port }),
+            Some("off") => return Ok(Html { shared, peers, rtt, api: false, custom_page: args.html.is_some(), port: args.html_port }),
             Some(a) => (a.to_string(), true),
             None => (format!("127.0.0.1:{}", args.html_port), false),
         };
@@ -46,8 +49,8 @@ impl Html {
         let api = match TcpListener::bind(sock) {
             Ok(listener) => {
                 println!("status API:     http://{addr}/  (JSON: /api/stats)");
-                let (shared, peers) = (shared.clone(), peers.clone());
-                std::thread::spawn(move || serve_api(listener, shared, peers));
+                let (shared, peers, rtt) = (shared.clone(), peers.clone(), rtt.clone());
+                std::thread::spawn(move || serve_api(listener, shared, peers, rtt));
                 true
             }
             Err(e) if !explicit => {
@@ -56,7 +59,14 @@ impl Html {
             }
             Err(e) => return Err(format!("--api {addr}: {e}").into()),
         };
-        Ok(Html { shared, peers, api, custom_page: args.html.is_some(), port: args.html_port })
+        Ok(Html { shared, peers, rtt, api, custom_page: args.html.is_some(), port: args.html_port })
+    }
+
+    /// New `/api/rtt` body.
+    pub(crate) fn set_rtt(&self, json: String) {
+        if self.api {
+            *self.rtt.lock().unwrap() = json;
+        }
     }
 
     /// New `/api/peers` body.
@@ -308,14 +318,14 @@ fn snapshot(ep: &Endpoint, now: u64) -> NetState {
 }
 
 /// Accept connections and answer each on its own thread.
-fn serve_api(listener: TcpListener, shared: Arc<Mutex<NetState>>, peers: Arc<Mutex<String>>) {
+fn serve_api(listener: TcpListener, shared: Arc<Mutex<NetState>>, peers: Arc<Mutex<String>>, rtt: Arc<Mutex<String>>) {
     for conn in listener.incoming().flatten() {
-        let (shared, peers) = (shared.clone(), peers.clone());
-        std::thread::spawn(move || handle_api_conn(conn, &shared, &peers));
+        let (shared, peers, rtt) = (shared.clone(), peers.clone(), rtt.clone());
+        std::thread::spawn(move || handle_api_conn(conn, &shared, &peers, &rtt));
     }
 }
 
-fn handle_api_conn(mut conn: TcpStream, shared: &Mutex<NetState>, peers: &Mutex<String>) {
+fn handle_api_conn(mut conn: TcpStream, shared: &Mutex<NetState>, peers: &Mutex<String>, rtt: &Mutex<String>) {
     let _ = conn.set_read_timeout(Some(Duration::from_secs(5)));
     let mut buf = [0u8; 1024];
     let n = conn.read(&mut buf).unwrap_or(0);
@@ -330,6 +340,7 @@ fn handle_api_conn(mut conn: TcpStream, shared: &Mutex<NetState>, peers: &Mutex<
             let st = shared.lock().unwrap();
             ("200 OK", "application/json", to_json(&st))
         }
+        ("GET", "/api/rtt") => ("200 OK", "application/json", rtt.lock().unwrap().clone()),
         ("GET", "/api/peers") => ("200 OK", "application/json", peers.lock().unwrap().clone()),
         ("GET", _) => ("404 Not Found", "text/plain; charset=utf-8", "not found\n".to_string()),
         _ => ("405 Method Not Allowed", "text/plain; charset=utf-8", "method not allowed\n".to_string()),

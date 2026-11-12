@@ -95,6 +95,10 @@ const ROOT_PROBE_SEQ: u16 = 2;
 const ALLOW_PROBE_SEQ: u16 = 3;
 /// Echo `seq` for a probe to a `--connect` server's address.
 const TARGET_PROBE_SEQ: u16 = 4;
+/// Echo `seq` for a `--monitor-file` address (display only, no effect on the peer search).
+const MONITOR_PROBE_SEQ: u16 = 5;
+/// Echo `seq` for the root's latency shown by `/api/rtt` (display only).
+const ROOT_MON_SEQ: u16 = 6;
 /// Print the latency to each `--connect` server every this many probes.
 const TARGET_REPORT_EVERY: u32 = 3;
 /// How often each allowed client's address is pinged.
@@ -314,6 +318,11 @@ struct Args {
     /// `--rtt-limit MS`: peer search replaces peers while the latency to the allowed keys or
     /// `--connect` servers is above this.
     rtt_limit: u64,
+    /// `--socks ADDR`: local SOCKS5 server for connections into the overlay (200::/7 only).
+    socks: Option<String>,
+    /// `--monitor-file PATH`: addresses (one per line) pinged every 10 s for `/api/rtt`; re-read
+    /// when it changes, so the list can change without a restart.
+    monitor_file: Option<String>,
     /// `--fwmark N`: SO_MARK on peer connections (Linux).
     fwmark: u32,
     /// `--swap-interval SECS` / `--swap-settle SECS`: peer search timing (see SearchConfig).
@@ -364,6 +373,10 @@ downloads the public peer list and connects.
                             PROXY v1 line with the caller's (key-verified) overlay address
   --rtt-limit MS            replace peers while the latency to the allowed keys or
                             to the --connect servers is above this (default 150)
+  --socks ADDR              local SOCKS5 (no auth, CONNECT) into Yggdrasil: any [200::/7]:port,
+                            e.g. 127.0.0.1:10810 (loopback only)
+  --monitor-file PATH       ping the addresses in PATH (one per line, re-read live) and the
+                            root every 10 s; latencies in /api/rtt (html build)
   --fwmark N                SO_MARK for peer connections (Linux, needs CAP_NET_ADMIN), so a VPN
                             routed through this node can route them around itself
   --swap-interval SECS      at least this long between two peer replacements
@@ -405,7 +418,7 @@ fn parse_connect(spec: &str) -> Result<(u16, Ipv6Addr, u16), String> {
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { key: None, connects: Vec::new(), peers: None, allow: Vec::new(), target: 3, send: None, ping: None, html: None, api: None, html_port: HTML_PORT, quality_ms: DEFAULT_RECHECK_MS, forwards: Vec::new(), open: Vec::new(), proxy_ports: Vec::new(), rtt_limit: CLIENT_RTT_LIMIT_MS, tun: None, tun_ctl: None, tun_server: None, swap_interval: None, swap_settle: None, fwmark: 0, forwards_udp: Vec::new(), send_udp: None, lan_upstream: false, no_public: false, listen: None, lan_target: None };
+    let mut a = Args { key: None, connects: Vec::new(), peers: None, allow: Vec::new(), target: 3, send: None, ping: None, html: None, api: None, html_port: HTML_PORT, quality_ms: DEFAULT_RECHECK_MS, forwards: Vec::new(), open: Vec::new(), proxy_ports: Vec::new(), rtt_limit: CLIENT_RTT_LIMIT_MS, tun: None, tun_ctl: None, tun_server: None, swap_interval: None, swap_settle: None, fwmark: 0, monitor_file: None, socks: None, forwards_udp: Vec::new(), send_udp: None, lan_upstream: false, no_public: false, listen: None, lan_target: None };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         match flag.as_str() {
@@ -471,6 +484,8 @@ fn parse_args() -> Args {
                     }
                 }
             }
+            "--socks" => a.socks = Some(it.next().unwrap_or_else(|| usage())),
+            "--monitor-file" => a.monitor_file = Some(it.next().unwrap_or_else(|| usage())),
             "--fwmark" => a.fwmark = it.next().and_then(|v| v.strip_prefix("0x").map(|h| u32::from_str_radix(h, 16).ok()).unwrap_or_else(|| v.parse().ok())).unwrap_or_else(|| usage()),
             "--swap-interval" => a.swap_interval = Some(it.next().and_then(|v| v.parse().ok()).filter(|v: &u64| (5..=3600).contains(v)).unwrap_or_else(|| usage())),
             "--swap-settle" => a.swap_settle = Some(it.next().and_then(|v| v.parse().ok()).filter(|v: &u64| (10..=3600).contains(v)).unwrap_or_else(|| usage())),
@@ -1239,6 +1254,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("connect:        127.0.0.1:{lport} -> [{addr}]:{port}");
         connect_listeners.push((l, *addr, *port));
     }
+    let socks_listener = match &args.socks {
+        Some(a) => {
+            let sa: SocketAddr = a.parse().map_err(|e| format!("--socks {a}: {e}"))?;
+            if !sa.ip().is_loopback() {
+                return Err(format!("--socks must listen on loopback, got {a}").into());
+            }
+            let l = TcpListener::bind(sa).map_err(|e| format!("--socks {a}: {e}"))?;
+            l.set_nonblocking(true)?;
+            println!("socks:          {a} -> Yggdrasil (200::/7)");
+            Some(l)
+        }
+        None => None,
+    };
 
     let addr = Address(ep.address().0);
     println!("device address: {}", Ipv6Addr::from(addr.0));
@@ -1291,6 +1319,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut target_sent: HashMap<[u8; 16], (u64, ProbeNonce)> = HashMap::new();
     let mut target_keys: Vec<PublicKey> = Vec::new();
     let mut target_rounds: u32 = 0;
+    // Display-only latencies: --monitor-file addresses, the --connect servers and the root.
+    let mut monitors: Vec<[u8; 16]> = Vec::new();
+    let mut monitor_text: Option<String> = None;
+    let mut monitor_sent: HashMap<[u8; 16], (u64, ProbeNonce)> = HashMap::new();
+    let mut rtts: HashMap<[u8; 16], RttMon> = HashMap::new();
+    let mut root_mon: Option<(PublicKey, u64, ProbeNonce)> = None;
+    let mut root_rtt: Option<(PublicKey, RttMon)> = None;
     let mut allow_sent: HashMap<PublicKey, (u64, ProbeNonce)> = HashMap::new();
     let mut last_allow_probe = Instant::now() - ALLOW_PROBE_INTERVAL;
     overlay.allow_keys = allow_keys.clone();
@@ -1541,10 +1576,34 @@ fn main() -> Result<(), Box<dyn Error>> {
                                     }
                                     overlay.allow_rtt.insert(msg.from_key, (sample, rx));
                                     finder.record_client(&msg.from_key, sample, rx);
+                                    rtts.entry(a).or_default().record(sample, rx);
                                     if target_rounds % TARGET_REPORT_EVERY == 1 {
                                         let avg = finder.client_rtt(rx).map(|v| format!("{v} ms")).unwrap_or("-".into());
                                         println!("server rtt:     [{}] {sample} ms (avg {avg}, limit {} ms)", Ipv6Addr::from(a), args.rtt_limit);
                                     }
+                                }
+                            }
+                        }
+                        MONITOR_PROBE_SEQ => {
+                            let a = addr_for_key(&msg.from_key).0;
+                            if let Some((sent, nonce)) = monitor_sent.get(&a).copied() {
+                                if nonce.as_slice() == echo.payload.as_slice() {
+                                    monitor_sent.remove(&a);
+                                    rtts.entry(a).or_default().record(rx.saturating_sub(sent), rx);
+                                }
+                            }
+                        }
+                        ROOT_MON_SEQ => {
+                            if let Some((root, sent, nonce)) = root_mon {
+                                if root == msg.from_key && nonce.as_slice() == echo.payload.as_slice() {
+                                    root_mon = None;
+                                    let e = match root_rtt.take() {
+                                        Some((k, m)) if k == root => Some((k, m)),
+                                        _ => None,
+                                    };
+                                    let mut m = e.map(|x| x.1).unwrap_or_default();
+                                    m.record(rx.saturating_sub(sent), rx);
+                                    root_rtt = Some((root, m));
                                 }
                             }
                         }
@@ -1633,9 +1692,27 @@ fn main() -> Result<(), Box<dyn Error>> {
             last_snap = Instant::now();
             html.refresh(&mut ep, &quality, &overlay, args.target + lan_slots, clock(start));
             html.set_peers(peer_traffic_json(&ep, &quality, &mut traffic, clock(start)));
+            html.set_rtt(rtt_json(&monitors, &targets, &rtts, root_rtt.as_ref(), ep.root(), clock(start)));
         }
 
         // TCP over the overlay: --forward (remote clients in) and --connect (local clients out).
+        // --socks: the handshake is read right here (a local client answers at once; 2 s cap).
+        if let Some(l) = &socks_listener {
+            while let Ok((sock, from)) = l.accept() {
+                match socks_handshake(&sock) {
+                    Ok((addr, port)) => match ep.tcp_connect(&Address(addr.octets()), port) {
+                        Some(id) if sock.set_nonblocking(true).is_ok() => {
+                            let _ = sock.set_nodelay(true);
+                            println!("tcp {id}: socks {from} -> [{addr}]:{port} connecting");
+                            bridges.insert(id, Bridge::new(sock, format!("[{addr}]:{port}")));
+                        }
+                        Some(id) => ep.tcp_abort(id),
+                        None => println!("tcp: connection limit reached, dropping socks {from}"),
+                    },
+                    Err(e) => println!("socks {from}: {e}"),
+                }
+            }
+        }
         for (l, addr, port) in &connect_listeners {
             while let Ok((sock, from)) = l.accept() {
                 let _ = sock.set_nodelay(true);
@@ -1763,6 +1840,28 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let nonce = new_nonce(&mut rng);
                 let acts = ep.ping_payload(&addr_for_key(k), QUALITY_ID, ALLOW_PROBE_SEQ, &nonce, now, &mut rng);
                 allow_sent.insert(*k, (clock(start), nonce)); // stamped right before the write
+                run(acts, &mut ep, &mut streams, &mut dialer, now);
+            }
+            // Display-only pings: the monitor list (re-read when it changes) and the root.
+            if let Some(path) = &args.monitor_file {
+                let text = std::fs::read_to_string(path).unwrap_or_default();
+                if monitor_text.as_deref() != Some(text.as_str()) {
+                    monitors = text.lines().filter_map(|l| l.trim().trim_matches(|c| c == '[' || c == ']').parse::<Ipv6Addr>().ok()).map(|a| a.octets()).collect();
+                    rtts.retain(|a, _| monitors.contains(a) || targets.contains(a));
+                    monitor_text = Some(text);
+                }
+                for a in monitors.iter().filter(|a| !targets.contains(a)) {
+                    let nonce = new_nonce(&mut rng);
+                    let acts = ep.ping_payload(&Address(*a), QUALITY_ID, MONITOR_PROBE_SEQ, &nonce, now, &mut rng);
+                    monitor_sent.insert(*a, (clock(start), nonce));
+                    run(acts, &mut ep, &mut streams, &mut dialer, now);
+                }
+            }
+            let root = ep.root();
+            if root != me {
+                let nonce = new_nonce(&mut rng);
+                let acts = ep.ping_key_payload(&root, QUALITY_ID, ROOT_MON_SEQ, &nonce, now, &mut rng);
+                root_mon = Some((root, clock(start), nonce));
                 run(acts, &mut ep, &mut streams, &mut dialer, now);
             }
             target_rounds = target_rounds.wrapping_add(1);
@@ -1922,6 +2021,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         for (l, _, _) in &connect_listeners {
             poller.add(l.as_raw_fd(), sys::IN);
         }
+        if let Some(l) = &socks_listener {
+            poller.add(l.as_raw_fd(), sys::IN);
+        }
         if let Some(s) = upstream_sock.as_ref() {
             poller.add(s.as_raw_fd(), sys::IN);
         }
@@ -1951,6 +2053,56 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 
+/// SOCKS5 (no auth, CONNECT) handshake on a fresh local connection: the overlay destination.
+/// Accepts IPv6 (ATYP 4) or an IPv6 literal as a domain (ATYP 3) inside 200::/7. Replies
+/// success at once; if the overlay connection then fails, the socket is just closed.
+fn socks_handshake(mut s: &TcpStream) -> Result<(Ipv6Addr, u16), String> {
+    s.set_nonblocking(false).map_err(|e| e.to_string())?;
+    s.set_read_timeout(Some(Duration::from_secs(2))).map_err(|e| e.to_string())?;
+    let mut b = [0u8; 262];
+    s.read_exact(&mut b[..2]).map_err(|e| e.to_string())?;
+    if b[0] != 5 {
+        return Err("not SOCKS5".into());
+    }
+    let n = b[1] as usize;
+    s.read_exact(&mut b[..n]).map_err(|e| e.to_string())?;
+    s.write_all(&[5, 0]).map_err(|e| e.to_string())?;
+    s.read_exact(&mut b[..4]).map_err(|e| e.to_string())?;
+    let (cmd, atyp) = (b[1], b[3]);
+    let fail = |mut s: &TcpStream, rep: u8, msg: &str| -> Result<(Ipv6Addr, u16), String> {
+        let _ = s.write_all(&[5, rep, 0, 1, 0, 0, 0, 0, 0, 0]);
+        Err(msg.into())
+    };
+    let addr = match atyp {
+        4 => {
+            s.read_exact(&mut b[..16]).map_err(|e| e.to_string())?;
+            let mut a = [0u8; 16];
+            a.copy_from_slice(&b[..16]);
+            Some(Ipv6Addr::from(a))
+        }
+        3 => {
+            s.read_exact(&mut b[..1]).map_err(|e| e.to_string())?;
+            let l = b[0] as usize;
+            s.read_exact(&mut b[..l]).map_err(|e| e.to_string())?;
+            String::from_utf8_lossy(&b[..l]).trim_matches(|c| c == '[' || c == ']').parse().ok()
+        }
+        _ => None,
+    };
+    let mut p = [0u8; 2];
+    s.read_exact(&mut p).map_err(|e| e.to_string())?;
+    let port = u16::from_be_bytes(p);
+    if cmd != 1 {
+        return fail(s, 7, "only CONNECT");
+    }
+    let Some(addr) = addr.filter(|a| a.octets()[0] & 0xfe == 0x02) else {
+        return fail(s, 2, "destination is not a Yggdrasil address");
+    };
+    let mut rep = vec![5, 0, 0, 4];
+    rep.extend_from_slice(&[0u8; 18]);
+    s.write_all(&rep).map_err(|e| e.to_string())?;
+    Ok((addr, port))
+}
+
 /// PROXY protocol v1 header. The source address is the one the endpoint checked against the
 /// sender's key, so the local program can trust it.
 fn proxy_v1(src: Ipv6Addr, dst: Ipv6Addr, sport: u16, dport: u16) -> String {
@@ -1967,6 +2119,51 @@ mod proxy_tests {
         let dst: Ipv6Addr = "201::1".parse().unwrap();
         assert_eq!(proxy_v1(src, dst, 40000, 8787), "PROXY TCP6 200:5d4:942c:661:7c2f:6725:af1c:eb0c 201::1 40000 8787\r\n");
     }
+}
+
+/// A display-only latency: last sample, smoothed value, when (protocol clock).
+#[derive(Default, Clone, Copy)]
+struct RttMon {
+    last: u64,
+    avg: u64,
+    at: u64,
+}
+
+impl RttMon {
+    fn record(&mut self, sample: u64, at: u64) {
+        self.avg = if self.at == 0 { sample } else { (self.avg * 3 + sample) / 4 };
+        self.last = sample;
+        self.at = at;
+    }
+}
+
+/// `/api/rtt`: latency to the monitored servers (and --connect targets) and to the root.
+/// A server with no answer in the last 60 s has `rtt_ms: null`.
+#[cfg_attr(not(feature = "html"), allow(dead_code))]
+fn rtt_json(monitors: &[[u8; 16]], targets: &[[u8; 16]], rtts: &HashMap<[u8; 16], RttMon>, root: Option<&(PublicKey, RttMon)>, root_key: PublicKey, now: u64) -> String {
+    let fresh = |m: &RttMon| m.at > 0 && now.saturating_sub(m.at) < 60_000;
+    let mut out = String::from("{\"servers\":[");
+    let mut seen: Vec<[u8; 16]> = Vec::new();
+    for a in targets.iter().chain(monitors) {
+        if seen.contains(a) {
+            continue;
+        }
+        seen.push(*a);
+        if seen.len() > 1 {
+            out.push(',');
+        }
+        let (rtt, avg) = match rtts.get(a).filter(|m| fresh(m)) {
+            Some(m) => (m.last.to_string(), m.avg.to_string()),
+            None => ("null".into(), "null".into()),
+        };
+        out.push_str(&format!("{{\"address\":\"{}\",\"connected\":{},\"rtt_ms\":{rtt},\"avg_ms\":{avg}}}", Ipv6Addr::from(*a), targets.contains(a)));
+    }
+    let root_part = match root.filter(|(k, m)| *k == root_key && fresh(m)) {
+        Some((_, m)) => format!("{{\"key\":\"{}\",\"rtt_ms\":{},\"avg_ms\":{}}}", hex(&root_key), m.last, m.avg),
+        None => format!("{{\"key\":\"{}\",\"rtt_ms\":null,\"avg_ms\":null}}", hex(&root_key)),
+    };
+    out.push_str(&format!("],\"root\":{root_part}}}"));
+    out
 }
 
 thread_local! {

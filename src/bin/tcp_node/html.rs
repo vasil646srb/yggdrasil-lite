@@ -32,5 +32,7 @@ mod stub {
         pub(crate) fn refresh(&self, _ep: &mut Endpoint, _q: &Quality, _o: &OverlayInfo, _slots: usize, _now: u64) {}
 
         pub(crate) fn set_peers(&self, _json: String) {}
+
+        pub(crate) fn set_rtt(&self, _json: String) {}
     }
 }
