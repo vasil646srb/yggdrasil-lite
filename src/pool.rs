@@ -45,11 +45,20 @@ struct Candidate {
     rtt_ms: Option<u64>,
     failures: u32,
     next_try_ms: u64,
+    /// Place in the caller's priority list (0 = best), see [`PeerPool::set_preferred`].
+    rank: Option<u32>,
 }
+
+/// Every ranked candidate scores below every unranked one.
+const UNRANKED_BASE: u64 = 1_000_000;
 
 impl Candidate {
     fn score(&self) -> u64 {
-        self.rtt_ms.unwrap_or(UNKNOWN_RTT_MS) + self.failures as u64 * FAILURE_PENALTY_MS
+        let penalty = self.failures as u64 * FAILURE_PENALTY_MS;
+        match self.rank {
+            Some(r) => r as u64 * 10 + penalty,
+            None => UNRANKED_BASE + self.rtt_ms.unwrap_or(UNKNOWN_RTT_MS) + penalty,
+        }
     }
 }
 
@@ -173,8 +182,44 @@ impl PeerPool {
             rtt_ms: rtt_hint_ms,
             failures: 0,
             next_try_ms: 0,
+            rank: None,
         });
         true
+    }
+
+    /// Priority list from the caller (best first), e.g. from a history of how well peers
+    /// carried traffic: these are dialed before any other candidate, in this order. Unknown
+    /// URIs are added as configured candidates. Replaces the previous list.
+    pub fn set_preferred(&mut self, uris: &[TcpPeerUri]) {
+        for c in self.candidates.iter_mut() {
+            c.rank = None;
+        }
+        for (i, u) in uris.iter().enumerate() {
+            let id = u.host_port();
+            match self.candidates.iter_mut().find(|c| c.uri.host_port() == id) {
+                Some(c) => c.rank = Some(c.rank.unwrap_or(i as u32).min(i as u32)),
+                None => {
+                    self.add_candidate(u.clone(), CandidateSource::Config);
+                    if let Some(c) = self.candidates.last_mut() {
+                        c.rank = Some(i as u32);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Rank of the candidate with this `host:port` in the priority list, if it is in it.
+    pub fn rank_of(&self, host_port: &str) -> Option<u32> {
+        self.candidates.iter().find(|c| c.uri.host_port() == host_port).and_then(|c| c.rank)
+    }
+
+    /// The best-ranked candidate that is not in a slot and may be dialed now.
+    pub fn best_ranked_idle(&self, now_ms: u64) -> Option<(u32, TcpPeerUri)> {
+        (0..self.candidates.len())
+            .filter(|&i| self.candidates[i].rank.is_some() && self.candidates[i].next_try_ms <= now_ms)
+            .filter(|&i| !self.slots.iter().any(|s| slot_uses(s, i)))
+            .min_by_key(|&i| self.candidates[i].score())
+            .map(|i| (self.candidates[i].rank.unwrap_or(u32::MAX), self.candidates[i].uri.clone()))
     }
 
     /// Expected public key of the peer being dialed in `slot`, if known.
@@ -326,6 +371,23 @@ mod tests {
 
     fn uri(s: &str) -> TcpPeerUri {
         TcpPeerUri::parse(s).unwrap()
+    }
+
+    #[test]
+    fn preferred_peers_are_dialed_first_in_list_order() {
+        let mut p = PeerPool::new(2);
+        p.add_candidate_with_rtt(uri("tcp://1.1.1.1:1"), CandidateSource::Config, Some(5));
+        p.add_candidate_with_rtt(uri("tcp://2.2.2.2:2"), CandidateSource::Config, Some(300));
+        // 3.3.3.3 is unknown to the pool: the list adds it.
+        p.set_preferred(&[uri("tcp://3.3.3.3:3"), uri("tcp://2.2.2.2:2")]);
+        let dials: Vec<String> = p.schedule(0).into_iter().map(|(_, u)| u.host_port()).collect();
+        assert_eq!(dials, ["3.3.3.3:3", "2.2.2.2:2"]);
+        assert_eq!(p.rank_of("2.2.2.2:2"), Some(1));
+        assert_eq!(p.rank_of("1.1.1.1:1"), None);
+        // A new list replaces the old ranks.
+        p.set_preferred(&[uri("tcp://1.1.1.1:1")]);
+        assert_eq!(p.rank_of("3.3.3.3:3"), None);
+        assert_eq!(p.best_ranked_idle(0).map(|x| x.1.host_port()), Some("1.1.1.1:1".into()));
     }
 
     #[test]

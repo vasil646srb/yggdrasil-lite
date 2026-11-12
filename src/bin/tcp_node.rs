@@ -414,6 +414,10 @@ struct Args {
     /// comes from PATH and is re-read live, so a client switches servers without a restart that
     /// would drop its peers and paths. An empty file: local connections are refused.
     connect_file: Option<(u16, String)>,
+    /// `--prefer-file PATH`: peer URIs, best first (one per line, re-read live). They are dialed
+    /// before any other candidate, and every 2 min a connected peer outside the list (or far
+    /// down it) gives way to a better listed one that is free.
+    prefer_file: Option<String>,
     /// `--fwmark N`: SO_MARK on peer connections (Linux).
     fwmark: u32,
     /// `--swap-interval SECS` / `--swap-settle SECS`: peer search timing (see SearchConfig).
@@ -466,6 +470,8 @@ downloads the public peer list and connects.
                             to the --connect servers is above this (default 150)
   --socks ADDR              local SOCKS5 (no auth, CONNECT) into Yggdrasil: any [200::/7]:port,
                             e.g. 127.0.0.1:10810 (loopback only)
+  --prefer-file PATH        peer URIs, best first, re-read live: dialed first, and a better
+                            listed peer replaces an unlisted one every 2 min
   --connect-file LPORT:PATH  like --connect, the server ([IPV6]:PORT) read live from PATH:
                             switching servers keeps the node's peers and paths
   --monitor-file PATH       ping the addresses in PATH (one per line, re-read live) and the
@@ -511,7 +517,7 @@ fn parse_connect(spec: &str) -> Result<(u16, Ipv6Addr, u16), String> {
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { key: None, connects: Vec::new(), peers: None, allow: Vec::new(), target: 3, send: None, ping: None, html: None, api: None, html_port: HTML_PORT, quality_ms: DEFAULT_RECHECK_MS, forwards: Vec::new(), open: Vec::new(), proxy_ports: Vec::new(), rtt_limit: CLIENT_RTT_LIMIT_MS, tun: None, tun_ctl: None, tun_server: None, swap_interval: None, swap_settle: None, fwmark: 0, monitor_file: None, connect_file: None, socks: None, forwards_udp: Vec::new(), send_udp: None, lan_upstream: false, no_public: false, listen: None, lan_target: None };
+    let mut a = Args { key: None, connects: Vec::new(), peers: None, allow: Vec::new(), target: 3, send: None, ping: None, html: None, api: None, html_port: HTML_PORT, quality_ms: DEFAULT_RECHECK_MS, forwards: Vec::new(), open: Vec::new(), proxy_ports: Vec::new(), rtt_limit: CLIENT_RTT_LIMIT_MS, tun: None, tun_ctl: None, tun_server: None, swap_interval: None, swap_settle: None, fwmark: 0, monitor_file: None, connect_file: None, prefer_file: None, socks: None, forwards_udp: Vec::new(), send_udp: None, lan_upstream: false, no_public: false, listen: None, lan_target: None };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         match flag.as_str() {
@@ -579,6 +585,7 @@ fn parse_args() -> Args {
             }
             "--socks" => a.socks = Some(it.next().unwrap_or_else(|| usage())),
             "--monitor-file" => a.monitor_file = Some(it.next().unwrap_or_else(|| usage())),
+            "--prefer-file" => a.prefer_file = Some(it.next().unwrap_or_else(|| usage())),
             "--connect-file" => {
                 let spec = it.next().unwrap_or_else(|| usage());
                 let (p, path) = spec.split_once(':').unwrap_or_else(|| usage());
@@ -1430,6 +1437,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         None => None,
     };
+    let mut prefer_text: Option<String> = None;
+    let mut last_prefer_read = Instant::now() - Duration::from_secs(60);
+    let mut last_upgrade = Instant::now();
     let mut file_target: Option<(Ipv6Addr, u16)> = None;
     let mut file_target_text: Option<String> = None;
     let mut last_target_read = Instant::now() - Duration::from_secs(10);
@@ -2113,6 +2123,49 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let acts = ep.ping_payload(&Address(*a), QUALITY_ID, TARGET_PROBE_SEQ, &nonce, now, &mut rng);
                 target_sent.insert(*a, (clock(start), nonce)); // stamped right before the write
                 run(acts, &mut ep, &mut streams, &mut dialer, now);
+            }
+        }
+
+        // --prefer-file: the caller's peer ranking (re-read live).
+        if let Some(path) = &args.prefer_file {
+            if last_prefer_read.elapsed() >= Duration::from_secs(5) {
+                last_prefer_read = Instant::now();
+                let text = std::fs::read_to_string(path).unwrap_or_default();
+                if prefer_text.as_deref() != Some(text.as_str()) {
+                    let uris: Vec<TcpPeerUri> = text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).filter_map(|l| TcpPeerUri::parse(l).ok()).collect();
+                    println!("prefer:         {} peers by priority", uris.len());
+                    ep.set_preferred_peers(&uris);
+                    prefer_text = Some(text);
+                }
+            }
+            // Upgrade: a free listed peer that ranks clearly better replaces the worst connected
+            // one (unlisted first), one at a time, so the set drifts towards the best peers.
+            if last_upgrade.elapsed() >= Duration::from_secs(120) && prefer_text.is_some() {
+                last_upgrade = Instant::now();
+                if let Some((best_rank, best_uri)) = ep.best_ranked_idle(now) {
+                    let worst = ep
+                        .connected_peers()
+                        .into_iter()
+                        .filter(|p| p.direction == Direction::Outbound && !p.lan)
+                        .filter(|p| !allow_keys.contains(&p.key) && !target_keys.contains(&p.key))
+                        .map(|p| {
+                            let rank = p.uri.as_ref().and_then(|u| ep.peer_rank(&u.host_port()));
+                            (rank.map(|r| r as u64).unwrap_or(u64::MAX), p.key, p.uri.map(|u| u.host_port()).unwrap_or_default())
+                        })
+                        .max_by_key(|x| x.0);
+                    let outbound = ep.connected_peers().iter().filter(|p| p.direction == Direction::Outbound).count();
+                    if let Some((wrank, wkey, whp)) = worst {
+                        // Only with a full set (otherwise the free slot gets the listed peer anyway).
+                        if outbound >= args.target && wrank > best_rank as u64 + 2 {
+                            let msg = format!("приоритет: {whp} уступает {} (место {} в списке)", best_uri.host_port(), best_rank + 1);
+                            println!("{msg}");
+                            push_swap(&mut overlay, msg);
+                            let acts = ep.drop_peer(&wkey, now, SLOW_PEER_COOLDOWN_MS);
+                            run(acts, &mut ep, &mut streams, &mut dialer, now);
+                            quality.forget(&wkey);
+                        }
+                    }
+                }
             }
         }
 

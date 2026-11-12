@@ -606,6 +606,21 @@ impl Endpoint {
         self.pool.candidates_info()
     }
 
+    /// Priority list of outbound peers (best first): dialed before any other candidate.
+    pub fn set_preferred_peers(&mut self, uris: &[TcpPeerUri]) {
+        self.pool.set_preferred(uris);
+    }
+
+    /// Place of `host:port` in the priority list.
+    pub fn peer_rank(&self, host_port: &str) -> Option<u32> {
+        self.pool.rank_of(host_port)
+    }
+
+    /// Best-ranked candidate not connected and not backing off: (rank, uri).
+    pub fn best_ranked_idle(&self, now_ms: u64) -> Option<(u32, TcpPeerUri)> {
+        self.pool.best_ranked_idle(now_ms)
+    }
+
     /// Number of peers the node currently has an established session with
     /// (outbound and accepted).
     pub fn peer_count(&self) -> usize {
