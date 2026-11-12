@@ -410,6 +410,10 @@ struct Args {
     /// `--monitor-file PATH`: addresses (one per line) pinged every 10 s for `/api/rtt`; re-read
     /// when it changes, so the list can change without a restart.
     monitor_file: Option<String>,
+    /// `--connect-file LPORT:PATH`: like `--connect`, but the server (`[IPV6]:PORT`, one line)
+    /// comes from PATH and is re-read live, so a client switches servers without a restart that
+    /// would drop its peers and paths. An empty file: local connections are refused.
+    connect_file: Option<(u16, String)>,
     /// `--fwmark N`: SO_MARK on peer connections (Linux).
     fwmark: u32,
     /// `--swap-interval SECS` / `--swap-settle SECS`: peer search timing (see SearchConfig).
@@ -462,6 +466,8 @@ downloads the public peer list and connects.
                             to the --connect servers is above this (default 150)
   --socks ADDR              local SOCKS5 (no auth, CONNECT) into Yggdrasil: any [200::/7]:port,
                             e.g. 127.0.0.1:10810 (loopback only)
+  --connect-file LPORT:PATH  like --connect, the server ([IPV6]:PORT) read live from PATH:
+                            switching servers keeps the node's peers and paths
   --monitor-file PATH       ping the addresses in PATH (one per line, re-read live) and the
                             root every 10 s; latencies in /api/rtt (html build)
   --fwmark N                SO_MARK for peer connections (Linux, needs CAP_NET_ADMIN), so a VPN
@@ -505,7 +511,7 @@ fn parse_connect(spec: &str) -> Result<(u16, Ipv6Addr, u16), String> {
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { key: None, connects: Vec::new(), peers: None, allow: Vec::new(), target: 3, send: None, ping: None, html: None, api: None, html_port: HTML_PORT, quality_ms: DEFAULT_RECHECK_MS, forwards: Vec::new(), open: Vec::new(), proxy_ports: Vec::new(), rtt_limit: CLIENT_RTT_LIMIT_MS, tun: None, tun_ctl: None, tun_server: None, swap_interval: None, swap_settle: None, fwmark: 0, monitor_file: None, socks: None, forwards_udp: Vec::new(), send_udp: None, lan_upstream: false, no_public: false, listen: None, lan_target: None };
+    let mut a = Args { key: None, connects: Vec::new(), peers: None, allow: Vec::new(), target: 3, send: None, ping: None, html: None, api: None, html_port: HTML_PORT, quality_ms: DEFAULT_RECHECK_MS, forwards: Vec::new(), open: Vec::new(), proxy_ports: Vec::new(), rtt_limit: CLIENT_RTT_LIMIT_MS, tun: None, tun_ctl: None, tun_server: None, swap_interval: None, swap_settle: None, fwmark: 0, monitor_file: None, connect_file: None, socks: None, forwards_udp: Vec::new(), send_udp: None, lan_upstream: false, no_public: false, listen: None, lan_target: None };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         match flag.as_str() {
@@ -573,6 +579,12 @@ fn parse_args() -> Args {
             }
             "--socks" => a.socks = Some(it.next().unwrap_or_else(|| usage())),
             "--monitor-file" => a.monitor_file = Some(it.next().unwrap_or_else(|| usage())),
+            "--connect-file" => {
+                let spec = it.next().unwrap_or_else(|| usage());
+                let (p, path) = spec.split_once(':').unwrap_or_else(|| usage());
+                let p: u16 = p.parse().ok().filter(|p| *p > 0).unwrap_or_else(|| usage());
+                a.connect_file = Some((p, path.to_string()));
+            }
             "--fwmark" => a.fwmark = it.next().and_then(|v| v.strip_prefix("0x").map(|h| u32::from_str_radix(h, 16).ok()).unwrap_or_else(|| v.parse().ok())).unwrap_or_else(|| usage()),
             "--swap-interval" => a.swap_interval = Some(it.next().and_then(|v| v.parse().ok()).filter(|v: &u64| (5..=3600).contains(v)).unwrap_or_else(|| usage())),
             "--swap-settle" => a.swap_settle = Some(it.next().and_then(|v| v.parse().ok()).filter(|v: &u64| (10..=3600).contains(v)).unwrap_or_else(|| usage())),
@@ -1407,6 +1419,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("connect:        127.0.0.1:{lport} -> [{addr}]:{port}");
         connect_listeners.push((l, *addr, *port));
     }
+    // --connect-file: the listener stays, the server behind it is read from the file (live).
+    let connect_file_listener: Option<(TcpListener, String)> = match &args.connect_file {
+        Some((lport, path)) => {
+            let l = TcpListener::bind((Ipv4Addr::LOCALHOST, *lport))
+                .map_err(|e| format!("--connect-file: cannot listen on 127.0.0.1:{lport}: {e}"))?;
+            l.set_nonblocking(true)?;
+            println!("connect:        127.0.0.1:{lport} -> server from {path}");
+            Some((l, path.clone()))
+        }
+        None => None,
+    };
+    let mut file_target: Option<(Ipv6Addr, u16)> = None;
+    let mut file_target_text: Option<String> = None;
+    let mut last_target_read = Instant::now() - Duration::from_secs(10);
     let socks_listener = match &args.socks {
         Some(a) => {
             let sa: SocketAddr = a.parse().map_err(|e| format!("--socks {a}: {e}"))?;
@@ -1866,6 +1892,70 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
         }
+        // --connect-file: switch the server when the file changes (peers and paths stay).
+        if let Some((_, path)) = &connect_file_listener {
+            if last_target_read.elapsed() >= Duration::from_millis(500) {
+                last_target_read = Instant::now();
+                let text = std::fs::read_to_string(path).unwrap_or_default();
+                if file_target_text.as_deref() != Some(text.as_str()) {
+                    let new = text.lines().map(str::trim).find(|l| !l.is_empty()).and_then(|l| {
+                        let (a, p) = l.strip_prefix('[')?.split_once("]:")?;
+                        Some((a.parse::<Ipv6Addr>().ok()?, p.parse::<u16>().ok().filter(|p| *p > 0)?))
+                    });
+                    file_target_text = Some(text);
+                    if new != file_target {
+                        let fixed: Vec<[u8; 16]> = args.connects.iter().map(|c| c.1.octets()).chain(args.tun_server.map(|a| a.octets())).collect();
+                        if let Some((old, oport)) = file_target.take() {
+                            let o = old.octets();
+                            if !fixed.contains(&o) {
+                                targets.retain(|a| *a != o);
+                                target_sent.remove(&o);
+                                rtts.remove(&o);
+                                let gone: Vec<PublicKey> = target_keys.iter().filter(|k| addr_for_key(k).0 == o).copied().collect();
+                                for k in &gone {
+                                    finder.forget_client(k);
+                                    overlay.allow_rtt.remove(k);
+                                    if !allow_keys.contains(k) {
+                                        overlay.allow_keys.retain(|x| x != k);
+                                    }
+                                }
+                                target_keys.retain(|k| !gone.contains(k));
+                            }
+                            // Connections through the old server end: apps reconnect through the new one.
+                            let label = format!("[{old}]:{oport}");
+                            let ids: Vec<ConnId> = bridges.iter().filter(|(_, b)| b.label == label).map(|(id, _)| *id).collect();
+                            for id in ids {
+                                ep.tcp_abort(id);
+                                bridges.remove(&id);
+                            }
+                        }
+                        if let Some((addr, port)) = new {
+                            if !targets.contains(&addr.octets()) {
+                                targets.push(addr.octets());
+                            }
+                            println!("connect:        server [{addr}]:{port} (from file, node not restarted)");
+                        } else {
+                            println!("connect:        no server in file");
+                        }
+                        file_target = new;
+                    }
+                }
+            }
+            while let Ok((sock, from)) = connect_file_listener.as_ref().unwrap().0.accept() {
+                let Some((addr, port)) = file_target else { continue }; // no server: closed
+                let _ = sock.set_nodelay(true);
+                if sock.set_nonblocking(true).is_err() {
+                    continue;
+                }
+                match ep.tcp_connect(&Address(addr.octets()), port) {
+                    Some(id) => {
+                        println!("tcp {id}: {from} -> [{addr}]:{port} connecting");
+                        bridges.insert(id, Bridge::new(sock, format!("[{addr}]:{port}")));
+                    }
+                    None => println!("tcp: connection limit reached, dropping {from}"),
+                }
+            }
+        }
         for (l, addr, port) in &connect_listeners {
             while let Ok((sock, from)) = l.accept() {
                 let _ = sock.set_nodelay(true);
@@ -2169,6 +2259,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         let stream_idx: Vec<(usize, usize)> =
             streams.iter().map(|(slot, s)| (*slot, poller.add(s.raw_fd(), sys::IN))).collect();
         if let Some(l) = listener.as_ref() {
+            poller.add(l.as_raw_fd(), sys::IN);
+        }
+        if let Some((l, _)) = &connect_file_listener {
             poller.add(l.as_raw_fd(), sys::IN);
         }
         for (l, _, _) in &connect_listeners {

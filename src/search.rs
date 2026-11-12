@@ -163,6 +163,11 @@ impl PeerSearch {
         self.clients.insert(*key, e);
     }
 
+    /// Forget an allowed key's samples (it is no longer a target, e.g. the client switched servers).
+    pub fn forget_client(&mut self, key: &PublicKey) {
+        self.clients.remove(key);
+    }
+
     /// One echo round trip to the global root.
     pub fn record_root(&mut self, sample_ms: u64, now: u64) {
         self.root = Some(Self::smooth(self.root, sample_ms, now, self.cfg.sample_ttl_ms, self.cfg.warmup));
