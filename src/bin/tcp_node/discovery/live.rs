@@ -1,6 +1,7 @@
 //! The real LAN discovery (see the parent module).
 
 use crate::*;
+#[cfg(unix)]
 use std::os::unix::io::FromRawFd;
 use std::sync::Mutex;
 
@@ -99,6 +100,13 @@ fn upstream_lan_socket() -> Result<UdpSocket, Box<dyn Error>> {
 /// and a yggdrasil-go on the same host (which sets both on its multicast socket) already
 /// holds the beacon port; a plain bind fails with "address already in use" and discovery
 /// would be off exactly where it is most likely wanted.
+#[cfg(windows)]
+fn bind_udp6_shared(port: u16) -> std::io::Result<UdpSocket> {
+    // SO_REUSEADDR on Windows lets anyone take the port over; a plain bind is the safe choice.
+    UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, port))
+}
+
+#[cfg(unix)]
 fn bind_udp6_shared(port: u16) -> std::io::Result<UdpSocket> {
     // SAFETY: plain socket calls; the descriptor is closed on every error path and otherwise
     // handed to `UdpSocket`, which owns it from then on. `sockaddr_in6` is zeroed first, so

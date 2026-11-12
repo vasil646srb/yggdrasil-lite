@@ -48,6 +48,11 @@ transit = []
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# tcp_node on Windows: WSAPoll for the main loop, the default-route interface for peer sockets.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis"] }
+socket2 = "0.5"
+
 [dev-dependencies]
 hex = "0.4"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

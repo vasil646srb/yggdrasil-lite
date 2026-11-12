@@ -53,8 +53,24 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV6, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawSocket, RawSocket as RawFd};
+
+/// Windows: sockets are `RawSocket`s; this keeps the poll loop's `as_raw_fd()` calls shared.
+#[cfg(windows)]
+trait AsRawFd {
+    fn as_raw_fd(&self) -> RawFd;
+}
+#[cfg(windows)]
+impl<T: AsRawSocket> AsRawFd for T {
+    fn as_raw_fd(&self) -> RawFd {
+        self.as_raw_socket()
+    }
+}
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -74,8 +90,34 @@ mod api_model;
 mod discovery;
 #[path = "tcp_node/html.rs"]
 mod html;
+#[cfg(unix)]
 #[path = "tcp_node/tun.rs"]
 mod tun;
+/// No TUN bridge on Windows (the VPN there is tun2proxy over Wintun, outside the node).
+#[cfg(windows)]
+mod tun {
+    pub enum Tun {}
+    impl Tun {
+        pub fn open(_: &str) -> std::io::Result<Tun> {
+            Err(std::io::Error::other("--tun is not supported on Windows"))
+        }
+        pub fn from_ctl(_: &str) -> std::io::Result<Tun> {
+            Err(std::io::Error::other("--tun-ctl is not supported on Windows"))
+        }
+        pub fn raw_fd(&self) -> super::RawFd {
+            match *self {}
+        }
+        pub fn read(&mut self, _: &mut [u8]) -> std::io::Result<Option<usize>> {
+            match *self {}
+        }
+        pub fn write(&mut self, _: &[u8]) {
+            match *self {}
+        }
+    }
+    pub fn route(_: &[u8], _: &[u8; 16]) -> Option<[u8; 16]> {
+        None
+    }
+}
 
 /// Protocol clock starts here (matches the library tests).
 const CLOCK_BASE: u64 = 1_000;
@@ -152,7 +194,9 @@ const PROBE_WORKERS: usize = 8;
 const FIRST_PROBE_MAX_WAIT: Duration = Duration::from_secs(60);
 
 /// `--fwmark N` (Linux): SO_MARK for peer connections, so policy routing can keep them out of a
-/// VPN that this node itself carries (0 = off).
+/// VPN that this node itself carries (0 = off). On Windows any non-zero value binds peer
+/// connections to the interface of the default route (IP_UNICAST_IF): a VPN that routes
+/// 0.0.0.0/1 + 128.0.0.0/1 (and ::/1 + 8000::/1) through its adapter does not catch them.
 static FWMARK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Connect to a peer, with `--fwmark` applied before the connect.
@@ -199,8 +243,51 @@ fn connect_peer(addr: &SocketAddr, timeout: Duration) -> std::io::Result<TcpStre
         s.set_nonblocking(false)?;
         return Ok(s);
     }
+    #[cfg(windows)]
+    if mark != 0 {
+        return winnet::connect_default_if(addr, timeout);
+    }
     let _ = mark;
     TcpStream::connect_timeout(addr, timeout)
+}
+
+#[cfg(windows)]
+mod winnet {
+    use std::net::{SocketAddr, TcpStream};
+    use std::os::windows::io::AsRawSocket;
+    use std::time::Duration;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIpForwardTable2, MIB_IPFORWARD_TABLE2};
+    use windows_sys::Win32::Networking::WinSock::{setsockopt, AF_INET, AF_INET6, IPPROTO_IP, IPPROTO_IPV6, IP_UNICAST_IF, IPV6_UNICAST_IF};
+
+    /// Interface index of the best default route (`/0`) of this family, or 0.
+    pub fn default_if(v6: bool) -> u32 {
+        let fam = if v6 { AF_INET6 } else { AF_INET };
+        let mut t: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+        // SAFETY: the table is allocated by the call and freed below; rows are read in bounds.
+        unsafe {
+            if GetIpForwardTable2(fam, &mut t) != 0 || t.is_null() {
+                return 0;
+            }
+            let n = (*t).NumEntries as usize;
+            let rows = std::slice::from_raw_parts((*t).Table.as_ptr(), n);
+            let best = rows.iter().filter(|r| r.DestinationPrefix.PrefixLength == 0).min_by_key(|r| r.Metric).map(|r| r.InterfaceIndex).unwrap_or(0);
+            FreeMibTable(t as *const _);
+            best
+        }
+    }
+
+    pub fn connect_default_if(addr: &SocketAddr, timeout: Duration) -> std::io::Result<TcpStream> {
+        let sock = socket2::Socket::new(socket2::Domain::for_address(*addr), socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+        let idx = default_if(addr.is_ipv6());
+        if idx != 0 {
+            // IPv4 wants the index in network byte order, IPv6 in host order.
+            let (level, opt, val) = if addr.is_ipv6() { (IPPROTO_IPV6, IPV6_UNICAST_IF, idx) } else { (IPPROTO_IP, IP_UNICAST_IF, idx.to_be()) };
+            // SAFETY: setsockopt with a u32 value on a socket we own.
+            unsafe { setsockopt(sock.as_raw_socket() as usize, level, opt, &val as *const u32 as *const u8, 4) };
+        }
+        sock.connect_timeout(&(*addr).into(), timeout)?;
+        Ok(sock.into())
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -647,6 +734,7 @@ fn pump_bridge(ep: &mut Endpoint, id: ConnId, b: &mut Bridge, buf: &mut [u8]) ->
 }
 
 /// `poll(2)` over a reusable descriptor set.
+#[cfg(unix)]
 mod sys {
     use super::RawFd;
     use std::time::Duration;
@@ -703,6 +791,70 @@ mod sys {
         }
     }
 
+}
+
+/// WSAPoll over a reusable socket set (Windows). Entries without events are left out of the
+/// call, so an idle hung-up socket cannot wake the loop.
+#[cfg(windows)]
+mod sys {
+    use super::RawFd;
+    use std::time::Duration;
+    use windows_sys::Win32::Networking::WinSock::{WSAPoll, POLLRDNORM, POLLWRNORM, WSAPOLLFD};
+
+    pub const IN: i16 = POLLRDNORM as i16;
+    pub const OUT: i16 = POLLWRNORM as i16;
+
+    #[derive(Default)]
+    pub struct Poller {
+        all: Vec<(RawFd, i16, i16)>,
+        active: Vec<WSAPOLLFD>,
+        map: Vec<usize>,
+    }
+
+    impl Poller {
+        pub fn clear(&mut self) {
+            self.all.clear();
+        }
+
+        pub fn add(&mut self, fd: RawFd, events: i16) -> usize {
+            self.all.push((fd, events, 0));
+            self.all.len() - 1
+        }
+
+        pub fn wait(&mut self, timeout_ms: u64) {
+            self.active.clear();
+            self.map.clear();
+            for (i, e) in self.all.iter_mut().enumerate() {
+                e.2 = 0;
+                if e.1 != 0 {
+                    self.active.push(WSAPOLLFD { fd: e.0 as usize, events: e.1, revents: 0 });
+                    self.map.push(i);
+                }
+            }
+            if self.active.is_empty() {
+                std::thread::sleep(Duration::from_millis(timeout_ms.min(1000)));
+                return;
+            }
+            let timeout = timeout_ms.min(i32::MAX as u64) as i32;
+            // SAFETY: `active` holds `len` initialized entries and stays borrowed for the call.
+            let r = unsafe { WSAPoll(self.active.as_mut_ptr(), self.active.len() as u32, timeout) };
+            if r < 0 {
+                std::thread::sleep(Duration::from_millis(timeout_ms.clamp(1, 10)));
+                return;
+            }
+            for (k, f) in self.active.iter().enumerate() {
+                self.all[self.map[k]].2 = f.revents;
+            }
+        }
+
+        pub fn ready(&self, idx: usize) -> bool {
+            self.all[idx].2 != 0
+        }
+
+        pub fn any_ready(&self) -> bool {
+            self.all.iter().any(|e| e.2 != 0)
+        }
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -794,6 +946,7 @@ fn save_peer_cache(path: &std::path::Path, json: &[u8]) {
 fn load_or_create_seed(path: &str) -> Result<[u8; 32], Box<dyn Error>> {
     match std::fs::read_to_string(path) {
         Ok(text) => {
+            #[cfg(unix)]
             if let Ok(meta) = std::fs::metadata(path) {
                 if meta.permissions().mode() & 0o077 != 0 {
                     eprintln!("warning: {path} is accessible to other users, run: chmod 600 {path}");
@@ -806,11 +959,11 @@ fn load_or_create_seed(path: &str) -> Result<[u8; 32], Box<dyn Error>> {
         Err(e) if e.kind() == ErrorKind::NotFound => {
             let mut seed = [0u8; 32];
             OsRng.fill_bytes(&mut seed);
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)?;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            opts.mode(0o600);
+            let mut file = opts.open(path)?;
             file.write_all(hex(&seed).as_bytes())?;
             Ok(seed)
         }
