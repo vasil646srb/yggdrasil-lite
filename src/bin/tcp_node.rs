@@ -219,6 +219,11 @@ struct Args {
     send_udp: Option<(Ipv6Addr, u16, String)>,
     /// `--forward-udp`: (overlay port, local port) pairs for UDP.
     forwards_udp: Vec<(u16, u16)>,
+    /// Overlay ports whose local side gets a PROXY v1 line with the verified source address.
+    proxy_ports: Vec<u16>,
+    open_ports: Vec<u16>,
+    max_conns: Option<usize>,
+    conn_buf_kb: Option<usize>,
     /// `--lan-upstream`: discover yggdrasil-go peers via their IPv6 link-local beacons (dial over TLS).
     lan_upstream: bool,
     /// `--no-public`: do not download the public peer list; use only `--peers FILE` and LAN discovery.
@@ -244,6 +249,12 @@ downloads the public peer list and connects.
   --forward PORT[:LOCAL],.. expose local TCP ports over Yggdrasil
   --connect LPORT:[ADDR]:PORT
                             carry 127.0.0.1:LPORT to [ADDR]:PORT over Yggdrasil
+  --proxy-protocol PORT,..  for these forwarded overlay ports, first send the local program a
+                            PROXY v1 line with the caller's (key-verified) overlay address
+  --open PORT,..             forwarded overlay ports open to every key (public service; the caller's
+                            key-verified address still reaches the program via --proxy-protocol)
+  --max-conns N             overlay TCP connections at once (default 64)
+  --conn-buf KB             send/receive buffer per overlay connection (default 256)
   --forward-udp PORT[:LOCAL],..  expose local UDP ports
   --api ADDR|off            status dashboard and /api/stats, loopback only
                             (html build; default 127.0.0.1:<html-port>)
@@ -277,7 +288,7 @@ fn parse_connect(spec: &str) -> Result<(u16, Ipv6Addr, u16), String> {
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { key: None, connects: Vec::new(), peers: None, allow: Vec::new(), target: 3, send: None, ping: None, html: None, api: None, html_port: HTML_PORT, quality_ms: DEFAULT_RECHECK_MS, forwards: Vec::new(), forwards_udp: Vec::new(), send_udp: None, lan_upstream: false, no_public: false, listen: None, lan_target: None };
+    let mut a = Args { key: None, connects: Vec::new(), peers: None, allow: Vec::new(), target: 3, send: None, ping: None, html: None, api: None, html_port: HTML_PORT, quality_ms: DEFAULT_RECHECK_MS, forwards: Vec::new(), forwards_udp: Vec::new(), proxy_ports: Vec::new(), open_ports: Vec::new(), max_conns: None, conn_buf_kb: None, send_udp: None, lan_upstream: false, no_public: false, listen: None, lan_target: None };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         match flag.as_str() {
@@ -316,6 +327,26 @@ fn parse_args() -> Args {
                     }));
                 }
             }
+            "--proxy-protocol" => {
+                let spec = it.next().unwrap_or_else(|| usage());
+                for part in spec.split(',') {
+                    a.proxy_ports.push(parse_forward(part.trim()).map(|(o, _)| o).unwrap_or_else(|e| {
+                        eprintln!("--proxy-protocol: {e}");
+                        std::process::exit(2);
+                    }));
+                }
+            }
+            "--open" => {
+                let spec = it.next().unwrap_or_else(|| usage());
+                for part in spec.split(',') {
+                    a.open_ports.push(parse_forward(part.trim()).map(|(o, _)| o).unwrap_or_else(|e| {
+                        eprintln!("--open: {e}");
+                        std::process::exit(2);
+                    }));
+                }
+            }
+            "--max-conns" => a.max_conns = Some(it.next().and_then(|v| v.parse().ok()).filter(|n| *n > 0).unwrap_or_else(|| usage())),
+            "--conn-buf" => a.conn_buf_kb = Some(it.next().and_then(|v| v.parse().ok()).filter(|n| *n >= 16).unwrap_or_else(|| usage())),
             "--quality-interval" => {
                 let secs: u64 = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
                 a.quality_ms = secs * 1000;
@@ -354,6 +385,14 @@ fn parse_args() -> Args {
     }
     if a.forwards.len() > 16 {
         eprintln!("at most 16 forwarded ports");
+        std::process::exit(2);
+    }
+    if let Some(p) = a.open_ports.iter().find(|p| !a.forwards.iter().any(|(o, _)| o == *p)) {
+        eprintln!("--open {p}: the port must also be in --forward");
+        std::process::exit(2);
+    }
+    if let Some(p) = a.proxy_ports.iter().find(|p| !a.forwards.iter().any(|(o, _)| o == *p)) {
+        eprintln!("--proxy-protocol: port {p} is not in --forward");
         std::process::exit(2);
     }
     if a.quality_ms < 10_000 {
@@ -412,6 +451,12 @@ impl Bridge {
     fn new(sock: TcpStream, label: String) -> Self {
         Self { sock, to_local: Vec::new(), to_local_off: 0, local_eof: false, remote_eof: false, shut_wr: false, label }
     }
+}
+
+/// PROXY protocol v1 header. The source address is the one the endpoint checked against the
+/// sender's key, so the local program can use it as the caller's identity.
+fn proxy_v1(src: Ipv6Addr, dst: Ipv6Addr, sport: u16, dport: u16) -> String {
+    format!("PROXY TCP6 {src} {dst} {sport} {dport}\r\n")
 }
 
 const BRIDGE_CHUNK: usize = 64 * 1024;
@@ -1017,6 +1062,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let lan_slots = if args.lan_upstream { args.lan_target.unwrap_or(args.target) } else { 0 };
     let mut ep = Endpoint::new_with_lan(seed, None, args.target, lan_slots);
+    if let Some(n) = args.max_conns {
+        ep.tcp_config_mut().max_conns = n;
+    }
+    if let Some(kb) = args.conn_buf_kb {
+        ep.tcp_config_mut().rcv_buf = kb * 1024;
+        ep.tcp_config_mut().snd_buf = kb * 1024;
+    }
     // tls:// peers only when this build can dial them.
     ep.set_tls_peers(cfg!(feature = "upstream-tls"));
     let cache_path = peer_cache_path(&key_path);
@@ -1053,6 +1105,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let forward_map: HashMap<u16, u16> = args.forwards.iter().copied().collect();
     for (overlay, local) in &args.forwards {
         ep.tcp_listen(*overlay);
+        if args.open_ports.contains(overlay) {
+            ep.open_port(*overlay);
+        }
         println!("forward:        overlay port {overlay} -> 127.0.0.1:{local}");
     }
     let mut connect_listeners: Vec<(TcpListener, Ipv6Addr, u16)> = Vec::new();
@@ -1419,11 +1474,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             match ev {
                 TcpEvent::Accepted { id, port } => {
                     let local = forward_map.get(&port).copied().unwrap_or(port);
-                    let peer = ep.tcp_remote(id).map(|(a, p)| format!("[{}]:{p}", Ipv6Addr::from(a.0))).unwrap_or_default();
+                    let remote = ep.tcp_remote(id);
+                    let peer = remote.map(|(a, p)| format!("[{}]:{p}", Ipv6Addr::from(a.0))).unwrap_or_default();
                     match connect_local(local) {
                         Some(sock) => {
                             println!("tcp {id}: {peer} -> overlay port {port} -> 127.0.0.1:{local}");
-                            bridges.insert(id, Bridge::new(sock, peer));
+                            let mut b = Bridge::new(sock, peer);
+                            if let (true, Some((a, p))) = (args.proxy_ports.contains(&port), remote) {
+                                b.to_local = proxy_v1(Ipv6Addr::from(a.0), Ipv6Addr::from(ep.address().0), p, port).into_bytes();
+                            }
+                            bridges.insert(id, b);
                         }
                         None => {
                             println!("tcp {id}: cannot connect to 127.0.0.1:{local}, resetting {peer}");
@@ -1729,5 +1789,17 @@ mod probe_nonce_tests {
         // The matching echo completes it once.
         assert_eq!(take_probe(&mut map, &key, &[1, 2, 3, 4, 5, 6, 7, 8]), Some(1_000));
         assert_eq!(take_probe(&mut map, &key, &[1, 2, 3, 4, 5, 6, 7, 8]), None);
+    }
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+
+    #[test]
+    fn proxy_v1_line() {
+        let src: Ipv6Addr = "200:5d4:942c:661:7c2f:6725:af1c:eb0c".parse().unwrap();
+        let dst: Ipv6Addr = "201::1".parse().unwrap();
+        assert_eq!(proxy_v1(src, dst, 40000, 8787), "PROXY TCP6 200:5d4:942c:661:7c2f:6725:af1c:eb0c 201::1 40000 8787\r\n");
     }
 }

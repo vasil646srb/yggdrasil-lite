@@ -294,6 +294,11 @@ impl TcpStack {
     }
 
     /// Accept connections on `port`.
+    /// Limits (connections, buffers): new values apply to connections opened afterwards.
+    pub fn config_mut(&mut self) -> &mut TcpConfig {
+        &mut self.cfg
+    }
+
     pub fn listen(&mut self, port: u16) {
         if !self.listening.contains(&port) {
             self.listening.push(port);
