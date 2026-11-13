@@ -952,7 +952,11 @@ impl Endpoint {
     /// port opened with [`tcp_listen_open`](Self::tcp_listen_open), or on a
     /// connection we opened.
     fn tcp_input(&mut self, source: &PublicKey, seg: &tcp::Segment) {
-        if seg.src != address::addr_for_key(source).0 {
+        // The source is the key's own address or a host in its /64 subnet (300::/8): sites
+        // often live behind a node in its subnet.
+        let own = seg.src == address::addr_for_key(source).0;
+        let in_subnet = seg.src[0] == 0x03 && seg.src[..8] == address::subnet_for_key(source).0[..];
+        if !own && !in_subnet {
             return;
         }
         if !self.allowed.contains(source)
