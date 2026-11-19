@@ -444,6 +444,9 @@ struct Args {
     lan_upstream: bool,
     /// `--no-public`: do not download the public peer list; use only `--peers FILE` and LAN discovery.
     no_public: bool,
+    /// `--keep-peer URI` (repeatable): the user's own peers (`host:port`): never dropped by the
+    /// peer search or the priority upgrade.
+    keep_peers: Vec<String>,
     /// `--lan-target`: outbound slots reserved for LAN peers (default: `--target`).
     lan_target: Option<usize>,
     /// `--listen PORT`: accept inbound TCP peers and advertise this port in beacons.
@@ -482,6 +485,8 @@ downloads the public peer list and connects.
                             search while no server is set (instead of the root), re-read live
   --prefer-file PATH        peer URIs, best first, re-read live: dialed first, and a better
                             listed peer replaces an unlisted one every 2 min
+  --keep-peer URI           the user's own peer (repeatable): never replaced by the peer
+                            search or the priority upgrade
   --connect-file LPORT:PATH  like --connect, the server ([IPV6]:PORT) read live from PATH:
                             switching servers keeps the node's peers and paths
   --monitor-file PATH       ping the addresses in PATH (one per line, re-read live) and the
@@ -527,7 +532,7 @@ fn parse_connect(spec: &str) -> Result<(u16, Ipv6Addr, u16), String> {
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { key: None, connects: Vec::new(), peers: None, allow: Vec::new(), target: 3, send: None, ping: None, html: None, api: None, html_port: HTML_PORT, quality_ms: DEFAULT_RECHECK_MS, forwards: Vec::new(), open: Vec::new(), proxy_ports: Vec::new(), rtt_limit: CLIENT_RTT_LIMIT_MS, tun: None, tun_ctl: None, tun_server: None, swap_interval: None, swap_settle: None, fwmark: 0, monitor_file: None, connect_file: None, prefer_file: None, search_file: None, socks: None, forwards_udp: Vec::new(), send_udp: None, lan_upstream: false, no_public: false, listen: None, lan_target: None };
+    let mut a = Args { key: None, connects: Vec::new(), peers: None, allow: Vec::new(), target: 3, send: None, ping: None, html: None, api: None, html_port: HTML_PORT, quality_ms: DEFAULT_RECHECK_MS, forwards: Vec::new(), open: Vec::new(), proxy_ports: Vec::new(), rtt_limit: CLIENT_RTT_LIMIT_MS, tun: None, tun_ctl: None, tun_server: None, swap_interval: None, swap_settle: None, fwmark: 0, monitor_file: None, connect_file: None, prefer_file: None, search_file: None, socks: None, forwards_udp: Vec::new(), send_udp: None, lan_upstream: false, no_public: false, listen: None, lan_target: None, keep_peers: Vec::new() };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         match flag.as_str() {
@@ -630,6 +635,13 @@ fn parse_args() -> Args {
             }
             "--lan-upstream" => a.lan_upstream = true,
             "--no-public" => a.no_public = true,
+            "--keep-peer" => {
+                let u = it.next().unwrap_or_else(|| usage());
+                match TcpPeerUri::parse(u.trim()) {
+                    Ok(u) => a.keep_peers.push(u.host_port()),
+                    Err(e) => eprintln!("--keep-peer {u}: {e:?}"),
+                }
+            }
             "--lan-target" => a.lan_target = Some(it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
             "--listen" => a.listen = Some(it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
             "--ping" => a.ping = Some(it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
@@ -2196,6 +2208,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         .into_iter()
                         .filter(|p| p.direction == Direction::Outbound && !p.lan)
                         .filter(|p| !allow_keys.contains(&p.key) && !target_keys.contains(&p.key))
+                        .filter(|p| !p.uri.as_ref().is_some_and(|u| args.keep_peers.contains(&u.host_port())))
                         .map(|p| {
                             let rank = p.uri.as_ref().and_then(|u| ep.peer_rank(&u.host_port()));
                             (rank.map(|r| r as u64).unwrap_or(u64::MAX), p.key, p.uri.map(|u| u.host_port()).unwrap_or_default())
@@ -2241,7 +2254,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             let outbound = ep.connected_peers().iter().filter(|p| p.direction == Direction::Outbound).count();
             // Peers that may be replaced: outbound, not found on the LAN, and not an allowed key
             // or a --connect server (connected directly, it is the shortest path there).
-            let keep: Vec<PublicKey> = allow_keys.iter().chain(target_keys.iter()).copied().collect();
+            let own: Vec<PublicKey> = ep
+                .connected_peers()
+                .into_iter()
+                .filter(|p| p.uri.as_ref().is_some_and(|u| args.keep_peers.contains(&u.host_port())))
+                .map(|p| p.key)
+                .collect();
+            let keep: Vec<PublicKey> = allow_keys.iter().chain(target_keys.iter()).chain(own.iter()).copied().collect();
             let candidates_to_drop = droppable(
                 ep.connected_peers()
                     .into_iter()
