@@ -541,7 +541,7 @@ downloads the public peer list and connects.
   --send IPV6 MESSAGE       datagram every 10 s (test aid)
   --send-udp IPV6 PORT MSG  UDP datagram every 5 s (test aid)
   --quality-interval SECS   network re-check interval (default 300)
-  --listen PORT             accept plain TCP peers on this port
+  --listen PORT             accept plain TCP peers on this port (IPv6 and IPv4)
   --lan-upstream            dial yggdrasil-go LAN peers (upstream-tls build)
   --lan-target N            outbound slots for LAN peers (upstream-tls build)";
 
@@ -1630,10 +1630,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut tun_buf = vec![0u8; 65536];
     let mut tun_dropped: u64 = 0;
     let listener = match args.listen {
-        Some(port) => match TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)) {
+        // [::] takes IPv4 too where the system allows it (Linux, Android); else IPv4 only.
+        Some(port) => match TcpListener::bind((Ipv6Addr::UNSPECIFIED, port)).ok().filter(|_| cfg!(not(windows))).map(Ok)
+            .unwrap_or_else(|| TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))) {
             Ok(l) => {
                 l.set_nonblocking(true)?;
-                println!("listen:         tcp 0.0.0.0:{port} (inbound, max {MAX_INBOUND})");
+                println!("listen:         tcp {} (inbound, max {MAX_INBOUND})", l.local_addr().map(|a| a.to_string()).unwrap_or_default());
                 Some(l)
             }
             Err(e) => {
