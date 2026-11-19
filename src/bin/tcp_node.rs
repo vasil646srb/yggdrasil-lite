@@ -93,6 +93,8 @@ mod html;
 #[cfg(unix)]
 #[path = "tcp_node/tun.rs"]
 mod tun;
+#[path = "tcp_node/ckr.rs"]
+mod ckr;
 /// No TUN bridge on Windows (the VPN there is tun2proxy over Wintun, outside the node).
 #[cfg(windows)]
 mod tun {
@@ -111,6 +113,24 @@ mod tun {
             match *self {}
         }
         pub fn write(&mut self, _: &[u8]) {
+            match *self {}
+        }
+        pub fn ctl_fd(&self) -> Option<super::RawFd> {
+            match *self {}
+        }
+        pub fn ctl_closed(&mut self) -> bool {
+            match *self {}
+        }
+    }
+    pub enum CtlListener {}
+    impl CtlListener {
+        pub fn bind(_: &str) -> std::io::Result<CtlListener> {
+            Err(std::io::Error::other("--ckr-ctl is not supported on Windows"))
+        }
+        pub fn raw_fd(&self) -> super::RawFd {
+            match *self {}
+        }
+        pub fn accept(&self) -> std::io::Result<Option<Tun>> {
             match *self {}
         }
     }
@@ -453,6 +473,12 @@ struct Args {
     listen: Option<u16>,
     /// `--connect LPORT:[ADDR]:PORT`: local listener carried to a remote overlay port.
     connects: Vec<(u16, Ipv6Addr, u16)>,
+    /// `--ckr-ctl PATH`: crypto-key routing client; the VPN hands a TUN fd over this socket.
+    ckr_ctl: Option<String>,
+    /// `--ckr-tun NAME`: crypto-key routing exit on Linux TUN interface NAME.
+    ckr_tun: Option<String>,
+    /// `--ckr-allow-file PATH`: who may use the CKR exit (`*` or Yggdrasil addresses).
+    ckr_allow: Option<String>,
 }
 
 const USAGE: &str = "usage: tcp_node [options]
@@ -487,6 +513,12 @@ downloads the public peer list and connects.
                             listed peer replaces an unlisted one every 2 min
   --keep-peer URI           the user's own peer (repeatable): never replaced by the peer
                             search or the priority upgrade
+  --ckr-ctl PATH            crypto-key routing client (Yggdrasil-ng compatible): a TUN fd
+                            handed over unix socket PATH at any time carries IPv4 and internet
+                            IPv6 to the --connect-file server; closing the socket detaches it
+  --ckr-tun NAME            crypto-key routing exit on Linux TUN NAME (the caller sets up
+                            10.77.0.1/16, fd77:7967:6772::1/64, forwarding and NAT)
+  --ckr-allow-file PATH     who may use the CKR exit: `*` or Yggdrasil addresses, re-read live
   --connect-file LPORT:PATH  like --connect, the server ([IPV6]:PORT) read live from PATH:
                             switching servers keeps the node's peers and paths
   --monitor-file PATH       ping the addresses in PATH (one per line, re-read live) and the
@@ -532,7 +564,7 @@ fn parse_connect(spec: &str) -> Result<(u16, Ipv6Addr, u16), String> {
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { key: None, connects: Vec::new(), peers: None, allow: Vec::new(), target: 3, send: None, ping: None, html: None, api: None, html_port: HTML_PORT, quality_ms: DEFAULT_RECHECK_MS, forwards: Vec::new(), open: Vec::new(), proxy_ports: Vec::new(), rtt_limit: CLIENT_RTT_LIMIT_MS, tun: None, tun_ctl: None, tun_server: None, swap_interval: None, swap_settle: None, fwmark: 0, monitor_file: None, connect_file: None, prefer_file: None, search_file: None, socks: None, forwards_udp: Vec::new(), send_udp: None, lan_upstream: false, no_public: false, listen: None, lan_target: None, keep_peers: Vec::new() };
+    let mut a = Args { key: None, connects: Vec::new(), peers: None, allow: Vec::new(), target: 3, send: None, ping: None, html: None, api: None, html_port: HTML_PORT, quality_ms: DEFAULT_RECHECK_MS, forwards: Vec::new(), open: Vec::new(), proxy_ports: Vec::new(), rtt_limit: CLIENT_RTT_LIMIT_MS, tun: None, tun_ctl: None, tun_server: None, swap_interval: None, swap_settle: None, fwmark: 0, monitor_file: None, connect_file: None, prefer_file: None, search_file: None, socks: None, forwards_udp: Vec::new(), send_udp: None, lan_upstream: false, no_public: false, listen: None, lan_target: None, keep_peers: Vec::new(), ckr_ctl: None, ckr_tun: None, ckr_allow: None };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         match flag.as_str() {
@@ -635,6 +667,9 @@ fn parse_args() -> Args {
             }
             "--lan-upstream" => a.lan_upstream = true,
             "--no-public" => a.no_public = true,
+            "--ckr-ctl" => a.ckr_ctl = Some(it.next().unwrap_or_else(|| usage())),
+            "--ckr-tun" => a.ckr_tun = Some(it.next().unwrap_or_else(|| usage())),
+            "--ckr-allow-file" => a.ckr_allow = Some(it.next().unwrap_or_else(|| usage())),
             "--keep-peer" => {
                 let u = it.next().unwrap_or_else(|| usage());
                 match TcpPeerUri::parse(u.trim()) {
@@ -1566,6 +1601,27 @@ fn main() -> Result<(), Box<dyn Error>> {
         (None, Some(path)) => Some(tun::Tun::from_ctl(path).map_err(|e| format!("--tun-ctl {path}: {e}"))?),
         _ => None,
     };
+    // Crypto-key routing: the client's tunnel arrives over --ckr-ctl at any time (it then
+    // takes the place of tun_dev); the exit has its own interface.
+    let ckr_ctl = match &args.ckr_ctl {
+        Some(p) => Some(tun::CtlListener::bind(p).map_err(|e| format!("--ckr-ctl {p}: {e}"))?),
+        None => None,
+    };
+    if let Some(p) = &args.ckr_ctl {
+        println!("ckr ctl:        {p}");
+    }
+    let mut ckr_client = false;
+    let mut ckr_exit: Option<(tun::Tun, ckr::Exit)> = match &args.ckr_tun {
+        Some(name) => {
+            let t = tun::Tun::open(name).map_err(|e| format!("--ckr-tun {name}: {e}"))?;
+            ep.set_ckr_accept(true);
+            ep.set_inbox_cap(4096);
+            println!("ckr exit:       {name} (clients {}.{}.0.0/16)", ckr::POOL4[0], ckr::POOL4[1]);
+            Some((t, ckr::Exit::new(args.ckr_allow.clone())))
+        }
+        None => None,
+    };
+    let mut ckr_stats = (0u64, 0u64); // (refused, malformed or foreign source)
     if tun_dev.is_some() {
         ep.set_inbox_cap(4096);
         println!("tun:            bridge up, our address {}/7", Ipv6Addr::from(ep.address().0));
@@ -1761,6 +1817,25 @@ fn main() -> Result<(), Box<dyn Error>> {
             // before all of that.
             let rx = clock(start);
             let from = Ipv6Addr::from(msg.from.0);
+            // Crypto-key routing: replies from our exit into the tunnel, clients into the exit.
+            if yggdrasil_lite::endpoint::is_ckr_packet(unframe_ipv6(&msg.data)) {
+                let exit_addr = file_target.map(|t| t.0.octets()).or(args.connects.first().map(|c| c.1.octets()));
+                if ckr_client && exit_addr == Some(msg.from.0) {
+                    if let Some(t) = tun_dev.as_mut() {
+                        t.write(unframe_ipv6(&msg.data));
+                    }
+                    continue;
+                }
+                if let Some((t, exit)) = ckr_exit.as_mut() {
+                    let mut pkt = unframe_ipv6(&msg.data).to_vec();
+                    match exit.inbound(&msg.from_key, &mut pkt) {
+                        ckr::In::Sent => t.write(&pkt),
+                        ckr::In::NotAllowed => ckr_stats.0 += 1,
+                        _ => ckr_stats.1 += 1,
+                    }
+                    continue;
+                }
+            }
             if let Some(echo) = icmp::parse_echo(unframe_ipv6(&msg.data)) {
                 if echo.kind == ECHO_REPLY && echo.id == QUALITY_ID {
                     match echo.seq {
@@ -2098,6 +2173,47 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
+        // --ckr-ctl: a VPN hands us its interface, or closed the one it gave.
+        if let Some(l) = &ckr_ctl {
+            match l.accept() {
+                Ok(Some(t)) => {
+                    tun_dev = Some(t);
+                    ckr_client = true;
+                    ep.set_inbox_cap(4096);
+                    println!("ckr:            tunnel attached");
+                }
+                Ok(None) => {}
+                Err(e) => println!("ckr:            tunnel handover failed: {e}"),
+            }
+        }
+        if ckr_client && tun_dev.as_mut().is_some_and(|t| t.ctl_closed()) {
+            tun_dev = None;
+            ckr_client = false;
+            println!("ckr:            tunnel detached");
+        }
+        let ckr_target: Option<[u8; 16]> = file_target.map(|t| t.0.octets()).or(args.connects.first().map(|c| c.1.octets()));
+        // CKR exit: replies from the internet back to their clients; the allow list re-read.
+        if let Some((t, exit)) = ckr_exit.as_mut() {
+            if let Some(msg) = exit.reload() {
+                println!("{msg}");
+            }
+            for _ in 0..512 {
+                match t.read(&mut tun_buf) {
+                    Ok(Some(n)) => {
+                        if let Some(key) = exit.outbound(&mut tun_buf[..n]) {
+                            let mut framed = Vec::with_capacity(n + 1);
+                            framed.push(yggdrasil_lite::IPV6_FRAME);
+                            framed.extend_from_slice(&tun_buf[..n]);
+                            let acts = ep.send_to_key(&key, &framed, now, &mut rng);
+                            run(acts, &mut ep, &mut streams, &mut dialer, now);
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => return Err(format!("ckr tun read: {e}").into()),
+                }
+            }
+        }
+
         // TUN -> Yggdrasil. Bounded per pass so peers and timers keep their turn.
         if let Some(t) = tun_dev.as_mut() {
             let ours = ep.address().0;
@@ -2108,7 +2224,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                             let acts = ep.send_packet(&dst, &frame_ipv6(&tun_buf[..n]), now, &mut rng);
                             run(acts, &mut ep, &mut streams, &mut dialer, now);
                         }
-                        None => tun_dropped += 1,
+                        None => match ckr_target.filter(|_| ckr_client) {
+                            Some(exit) if ckr::client_packet(&tun_buf[..n], &ours) => {
+                                let mut framed = Vec::with_capacity(n + 1);
+                                framed.push(yggdrasil_lite::IPV6_FRAME);
+                                framed.extend_from_slice(&tun_buf[..n]);
+                                let acts = ep.send_packet(&exit, &framed, now, &mut rng);
+                                run(acts, &mut ep, &mut streams, &mut dialer, now);
+                            }
+                            _ => tun_dropped += 1,
+                        },
                     },
                     Ok(None) => break,
                     Err(e) => return Err(format!("tun read: {e}").into()),
@@ -2344,6 +2469,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         if last_status.elapsed() >= Duration::from_secs(10) {
             last_status = Instant::now();
             print_peers(&ep, streams.len(), clock(start));
+            if ckr_stats != (0, 0) {
+                println!("ckr:            refused {} packet(s) from keys without access, {} malformed or from a foreign address", ckr_stats.0, ckr_stats.1);
+                ckr_stats = (0, 0);
+            }
+            if let Some((_, exit)) = &ckr_exit {
+                if exit.clients() > 0 {
+                    println!("ckr:            exit clients {}", exit.clients());
+                }
+            }
             if tun_dropped > 0 {
                 println!("tun:            {tun_dropped} packet(s) dropped (not to 200::/7, or not from our address)");
                 tun_dropped = 0;
@@ -2394,6 +2528,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             poller.add(s.as_raw_fd(), sys::IN);
         }
         if let Some(t) = tun_dev.as_ref() {
+            poller.add(t.raw_fd(), sys::IN);
+            if let Some(fd) = t.ctl_fd() {
+                poller.add(fd, sys::IN);
+            }
+        }
+        if let Some(l) = &ckr_ctl {
+            poller.add(l.raw_fd(), sys::IN);
+        }
+        if let Some((t, _)) = &ckr_exit {
             poller.add(t.raw_fd(), sys::IN);
         }
         for s in udp_sessions.values() {
@@ -2518,11 +2661,12 @@ fn rtt_json(monitors: &[[u8; 16]], targets: &[[u8; 16]], rtts: &HashMap<[u8; 16]
         if seen.len() > 1 {
             out.push(',');
         }
-        let (rtt, avg) = match rtts.get(a).filter(|m| fresh(m)) {
-            Some(m) => (m.last.to_string(), m.avg.to_string()),
-            None => ("null".into(), "null".into()),
+        let (rtt, avg, age) = match rtts.get(a).filter(|m| fresh(m)) {
+            Some(m) => (m.last.to_string(), m.avg.to_string(), now.saturating_sub(m.at).to_string()),
+            None => ("null".into(), "null".into(), "null".into()),
         };
-        out.push_str(&format!("{{\"address\":\"{}\",\"connected\":{},\"rtt_ms\":{rtt},\"avg_ms\":{avg}}}", Ipv6Addr::from(*a), targets.contains(a)));
+        // age_ms: how old the last answer is (a CKR client tells a dead exit by it).
+        out.push_str(&format!("{{\"address\":\"{}\",\"connected\":{},\"rtt_ms\":{rtt},\"avg_ms\":{avg},\"age_ms\":{age}}}", Ipv6Addr::from(*a), targets.contains(a)));
     }
     let root_part = match root.filter(|(k, m)| *k == root_key && fresh(m)) {
         Some((_, m)) => format!("{{\"key\":\"{}\",\"rtt_ms\":{},\"avg_ms\":{}}}", hex(&root_key), m.last, m.avg),

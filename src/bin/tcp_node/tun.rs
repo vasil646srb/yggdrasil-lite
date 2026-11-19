@@ -77,6 +77,22 @@ impl Tun {
         self.file.as_raw_fd()
     }
 
+    /// The control connection's fd (poll it: it turns readable when the other side closes).
+    pub fn ctl_fd(&self) -> Option<RawFd> {
+        self._ctl.as_ref().map(|c| c.as_raw_fd())
+    }
+
+    /// The control connection was closed by the side that handed us the interface.
+    pub fn ctl_closed(&mut self) -> bool {
+        let Some(c) = self._ctl.as_mut() else { return false };
+        let mut b = [0u8; 64];
+        match c.read(&mut b) {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(e) => !matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted),
+        }
+    }
+
     /// One packet, or `None` when nothing is waiting.
     pub fn read(&mut self, buf: &mut [u8]) -> std::io::Result<Option<usize>> {
         match self.file.read(buf) {
@@ -89,6 +105,45 @@ impl Tun {
     /// Write one packet; a full interface queue drops it (like a router would).
     pub fn write(&mut self, pkt: &[u8]) {
         let _ = self.file.write(pkt);
+    }
+}
+
+/// `--ckr-ctl PATH`: a unix socket the VPN side connects to, any time, to hand the node a TUN
+/// fd (SCM_RIGHTS) for the crypto-key routing tunnel; closing that connection detaches it.
+pub struct CtlListener {
+    listener: std::os::unix::net::UnixListener,
+}
+
+impl CtlListener {
+    pub fn bind(path: &str) -> std::io::Result<CtlListener> {
+        let _ = std::fs::remove_file(path);
+        let listener = std::os::unix::net::UnixListener::bind(path)?;
+        listener.set_nonblocking(true)?;
+        // The daemon (root) or the app's own uid connects; nobody else on the machine.
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        Ok(CtlListener { listener })
+    }
+
+    pub fn raw_fd(&self) -> RawFd {
+        self.listener.as_raw_fd()
+    }
+
+    /// A newly handed interface, if a connection is waiting.
+    pub fn accept(&self) -> std::io::Result<Option<Tun>> {
+        let stream = match self.listener.accept() {
+            Ok((s, _)) => s,
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        stream.set_nonblocking(false)?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        let fd = recv_fd(stream.as_raw_fd())?;
+        set_nonblocking(fd)?;
+        stream.set_nonblocking(true)?;
+        // SAFETY: the fd was just received and is owned by nobody else in this process.
+        let file = unsafe { File::from_raw_fd(fd) };
+        Ok(Some(Tun { file, _ctl: Some(stream) }))
     }
 }
 

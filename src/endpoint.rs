@@ -160,6 +160,9 @@ pub struct Endpoint {
     /// Also answer echo requests from keys that are not allowed (public services, so clients
     /// can measure the path to us). Default off.
     ping_any: bool,
+    /// Crypto-key routing exit: IPv4 and non-Yggdrasil IPv6 packets from any key reach
+    /// [`recv`](Self::recv) (the caller checks who may use the exit). Default off.
+    ckr_any: bool,
     /// Accept `tls://` candidates (the platform can dial TLS). Default off.
     tls_peers: bool,
     /// Echo replies waiting to be sent: (destination key, IPv6 packet).
@@ -187,6 +190,16 @@ pub struct Endpoint {
 /// starts with it, and the IPv6 header begins at byte 1).
 pub const IPV6_FRAME: u8 = 0x01;
 
+/// A crypto-key routing packet (Yggdrasil-ng / yggdrasilckr): IPv4, or IPv6 whose
+/// destination is outside Yggdrasil (`200::/7`), carried with the same frame byte.
+pub fn is_ckr_packet(ip: &[u8]) -> bool {
+    match ip.first().map(|b| b >> 4) {
+        Some(4) => ip.len() >= 20,
+        Some(6) => ip.len() >= 40 && !matches!(ip[24], 0x02 | 0x03),
+        _ => false,
+    }
+}
+
 /// Prepend the IPv6 frame byte to an IPv6 packet before sending it.
 pub fn frame_ipv6(pkt: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(pkt.len() + 1);
@@ -198,7 +211,8 @@ pub fn frame_ipv6(pkt: &[u8]) -> Vec<u8> {
 /// Return the IPv6 packet inside a received datagram: strips the frame byte if
 /// present, otherwise returns the data unchanged.
 pub fn unframe_ipv6(data: &[u8]) -> &[u8] {
-    if data.len() > 1 && data[0] == IPV6_FRAME && data[1] >> 4 == 6 {
+    // IPv4 too: crypto-key routing (Yggdrasil-ng) carries it with the same frame byte.
+    if data.len() > 1 && data[0] == IPV6_FRAME && matches!(data[1] >> 4, 4 | 6) {
         &data[1..]
     } else {
         data
@@ -258,6 +272,7 @@ impl Endpoint {
             allowed: Vec::new(),
             ping_replies: true,
             ping_any: false,
+            ckr_any: false,
             tls_peers: false,
             outbox: VecDeque::new(),
             tcp,
@@ -295,6 +310,12 @@ impl Endpoint {
 
     /// Enable or disable automatic replies to ICMPv6 echo requests.
     /// Answer echo requests from any key, not only allowed ones (see `ping_any`).
+    /// Crypto-key routing exit: deliver IPv4 and non-Yggdrasil IPv6 packets from any key (see
+    /// [`is_ckr_packet`]); the caller decides which keys may use it.
+    pub fn set_ckr_accept(&mut self, on: bool) {
+        self.ckr_any = on;
+    }
+
     pub fn set_ping_any(&mut self, on: bool) {
         self.ping_any = on;
     }
@@ -1009,6 +1030,13 @@ impl Endpoint {
                     let our = self.node.address().0;
                     let ip = unframe_ipv6(&data);
                     let contacted = self.contacted.contains(&source);
+                    if self.ckr_any && is_ckr_packet(ip) {
+                        if self.inbox.len() >= self.inbox_cap {
+                            self.inbox.pop_front();
+                        }
+                        self.inbox.push_back(Received { from: address::addr_for_key(&source), from_key: source, data });
+                        continue;
+                    }
                     // TCP to our address goes to the stack (which checks keys itself), except
                     // a TUN bridge's own connections to nodes it wrote to.
                     if let Some(seg) = tcp::parse(ip) {
