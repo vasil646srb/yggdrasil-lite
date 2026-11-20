@@ -272,6 +272,12 @@ pub struct TcpStack {
 
 impl TcpStack {
     /// `our` is the overlay address; `secret` keys the initial sequence numbers.
+    /// Receive and send buffer per connection, for connections opened from now on.
+    pub fn set_buffers(&mut self, rcv_buf: usize, snd_buf: usize) {
+        self.cfg.rcv_buf = rcv_buf;
+        self.cfg.snd_buf = snd_buf;
+    }
+
     pub fn new(our: Addr, secret: [u8; 32], cfg: TcpConfig) -> Self {
         let port_seed = u16::from_be_bytes([secret[0], secret[1]]);
         Self {

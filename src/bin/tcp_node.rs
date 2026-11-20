@@ -1774,6 +1774,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let lan_slots = if args.lan_upstream { args.lan_target.unwrap_or(args.target) } else { 0 };
     let mut ep = Endpoint::new_with_lan(seed, None, args.target, lan_slots);
+    // 1 MiB windows: the overlay RTT to an exit is often 100+ ms on mobile links, and 256 KiB
+    // would cap each connection (proxy VPN, speed test) near 15-20 Mbit/s there.
+    ep.set_tcp_buffers(1024 * 1024, 1024 * 1024);
     // tls:// peers only when this build can dial them.
     ep.set_tls_peers(cfg!(feature = "upstream-tls"));
     let cache_path = peer_cache_path(&key_path);
@@ -1980,6 +1983,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut traffic: HashMap<usize, PeerTraffic> = HashMap::new();
     let mut tun_buf = vec![0u8; 65536];
     let mut tun_dropped: u64 = 0;
+    // CKR client tunnel bytes (to the exit / from it), printed as `STAT tun tx=N rx=N` each
+    // second while attached: the same line ygghelper prints for the proxy VPN.
+    let (mut ckr_tx, mut ckr_rx): (u64, u64) = (0, 0);
+    let mut ckr_stat_at = Instant::now();
     let listener = match args.listen {
         // [::] takes IPv4 too where the system allows it (Linux, Android); else IPv4 only.
         Some(port) => match TcpListener::bind((Ipv6Addr::UNSPECIFIED, port)).ok().filter(|_| cfg!(not(windows))).map(Ok)
@@ -2179,7 +2186,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let exit_addr = file_target.map(|t| t.0.octets()).or(args.connects.first().map(|c| c.1.octets()));
                 if ckr_client && exit_addr == Some(msg.from.0) {
                     if let Some(t) = tun_dev.as_mut() {
-                        t.write(unframe_ipv6(&msg.data));
+                        let pkt = unframe_ipv6(&msg.data);
+                        ckr_rx += pkt.len() as u64;
+                        t.write(pkt);
                     }
                     continue;
                 }
@@ -2583,6 +2592,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         }
                         None => match ckr_target.filter(|_| ckr_client) {
                             Some(exit) if ckr::client_packet(&tun_buf[..n], &ours) => {
+                                ckr_tx += n as u64;
                                 let mut framed = Vec::with_capacity(n + 1);
                                 framed.push(yggdrasil_lite::IPV6_FRAME);
                                 framed.extend_from_slice(&tun_buf[..n]);
@@ -2768,6 +2778,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .map(|p| (p.key, quality.rtt(&p.key).or(p.rtt_ms))),
                 &keep,
             );
+            // Never the last outbound peer: dropping it cuts the node (and an exit's clients) off
+            // until the next one connects.
+            let candidates_to_drop = if outbound >= 2 { candidates_to_drop } else { Vec::new() };
             if let Some(d) = finder.decide(now, &candidates_to_drop, ep.candidates().len() > outbound) {
                 let limit = match d.metric {
                     Metric::Client(_) => args.rtt_limit,
@@ -2841,6 +2854,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
+        if ckr_client && ckr_stat_at.elapsed() >= Duration::from_secs(1) {
+            ckr_stat_at = Instant::now();
+            println!("STAT tun tx={ckr_tx} rx={ckr_rx}");
+        }
         if last_status.elapsed() >= Duration::from_secs(10) {
             last_status = Instant::now();
             print_peers(&ep, streams.len(), clock(start));

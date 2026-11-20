@@ -623,6 +623,12 @@ impl Endpoint {
         self.node.set_avoid_parents(keys);
     }
 
+    /// Overlay TCP receive/send buffer per connection (new connections). The window caps a
+    /// connection at about `rcv_buf / RTT`; the default (256 KiB) suits small devices.
+    pub fn set_tcp_buffers(&mut self, rcv_buf: usize, snd_buf: usize) {
+        self.tcp.set_buffers(rcv_buf, snd_buf);
+    }
+
     /// Hold back or release outbound dialing (see [`PeerPool::set_dial_enabled`]).
     pub fn set_dial_enabled(&mut self, on: bool) {
         self.pool.set_dial_enabled(on);
