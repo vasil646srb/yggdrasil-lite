@@ -612,6 +612,12 @@ impl Endpoint {
         out
     }
 
+    /// Dial only these peers (unknown ones are added); `None` lifts the limit.
+    /// See [`PeerPool::set_only`].
+    pub fn set_only_peers(&mut self, uris: Option<&[TcpPeerUri]>) {
+        self.pool.set_only(uris);
+    }
+
     /// Hold back or release outbound dialing (see [`PeerPool::set_dial_enabled`]).
     pub fn set_dial_enabled(&mut self, on: bool) {
         self.pool.set_dial_enabled(on);

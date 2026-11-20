@@ -359,6 +359,115 @@ fn probe_tcp(uri: &TcpPeerUri) -> Option<u64> {
     Some(rtt)
 }
 
+/// The exit server's own peers (`--server-peers-file`): while one of them is reachable the
+/// node dials only those and drops its other outbound peers (LAN peers stay), so the path to
+/// the server is direct. When none is up for [`SERVER_PEER_GRACE`] the limit is lifted and the
+/// usual peers take over; a TCP probe every [`SERVER_PEER_RECHECK`] brings it back.
+struct ServerPeers {
+    text: Option<String>,
+    last_read: Instant,
+    uris: Vec<TcpPeerUri>,
+    /// `host:port` of `uris`.
+    ids: Vec<String>,
+    /// Only the server's peers are dialed.
+    only: bool,
+    /// Last time one of them was up (or `only` began).
+    last_up: Instant,
+    next_probe: Instant,
+    probe: Option<mpsc::Receiver<bool>>,
+    /// Outbound peers to drop now (filled by `tick`).
+    drop: Vec<PublicKey>,
+}
+
+const SERVER_PEER_GRACE: Duration = Duration::from_secs(30);
+const SERVER_PEER_RECHECK: Duration = Duration::from_secs(60);
+
+impl ServerPeers {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self { text: None, last_read: now - Duration::from_secs(60), uris: Vec::new(), ids: Vec::new(), only: false, last_up: now, next_probe: now, probe: None, drop: Vec::new() }
+    }
+
+    fn set_only(&mut self, ep: &mut Endpoint, on: bool) {
+        self.only = on;
+        self.last_up = Instant::now();
+        ep.set_only_peers(if on { Some(&self.uris) } else { None });
+    }
+
+    /// Re-read the file, switch modes; returns log lines.
+    fn tick(&mut self, path: &str, ep: &mut Endpoint, target: usize) -> Vec<String> {
+        let mut log = Vec::new();
+        if self.last_read.elapsed() >= Duration::from_secs(3) {
+            self.last_read = Instant::now();
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            if self.text.as_deref() != Some(text.as_str()) {
+                self.uris = text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).filter_map(|l| TcpPeerUri::parse(l).ok()).collect();
+                self.ids = self.uris.iter().map(|u| u.host_port()).collect();
+                self.probe = None;
+                if self.uris.is_empty() {
+                    if self.text.as_deref().is_some_and(|t| !t.trim().is_empty()) {
+                        log.push("пир сервера: нет, обычные пиры".to_string());
+                    }
+                    self.set_only(ep, false);
+                } else {
+                    log.push(format!("пир сервера: {} — только он, пока доступен", self.ids.join(", ")));
+                    self.set_only(ep, true);
+                }
+                self.text = Some(text);
+            }
+        }
+        if self.uris.is_empty() {
+            return log;
+        }
+        let peers = ep.connected_peers();
+        let outbound: Vec<_> = peers.iter().filter(|p| p.direction == Direction::Outbound && !p.lan).collect();
+        let is_server = |p: &&PeerInfo| p.uri.as_ref().is_some_and(|u| self.ids.contains(&u.host_port()));
+        let up = outbound.iter().any(is_server);
+        if self.only {
+            let others: Vec<PublicKey> = outbound.iter().filter(|p| !is_server(p)).map(|p| p.key).collect();
+            if up {
+                self.last_up = Instant::now();
+                if !others.is_empty() {
+                    log.push(format!("пир сервера подключён: остальные пиры ({}) отключены", others.len()));
+                    self.drop = others;
+                }
+            } else if self.last_up.elapsed() >= SERVER_PEER_GRACE {
+                log.push(format!("пир сервера недоступен — обычные пиры, проверка раз в {} с", SERVER_PEER_RECHECK.as_secs()));
+                self.set_only(ep, false);
+                self.next_probe = Instant::now() + SERVER_PEER_RECHECK;
+            } else if outbound.len() >= target && !others.is_empty() {
+                // Every slot is taken: free one for the server's peer.
+                self.drop = vec![others[others.len() - 1]];
+            }
+        } else if up {
+            // Connected on its own (e.g. picked as an ordinary candidate).
+            log.push("пир сервера снова доступен — только он".to_string());
+            self.set_only(ep, true);
+        } else if let Some(rx) = &self.probe {
+            match rx.try_recv() {
+                Ok(true) => {
+                    self.probe = None;
+                    log.push("пир сервера снова доступен — только он".to_string());
+                    self.set_only(ep, true);
+                }
+                Ok(false) | Err(mpsc::TryRecvError::Disconnected) => {
+                    self.probe = None;
+                    self.next_probe = Instant::now() + SERVER_PEER_RECHECK;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        } else if Instant::now() >= self.next_probe {
+            let (tx, rx) = mpsc::channel();
+            let uris = self.uris.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(uris.iter().any(|u| probe_tcp(u).is_some()));
+            });
+            self.probe = Some(rx);
+        }
+        log
+    }
+}
+
 /// Probe `uris` on `PROBE_WORKERS` threads; each result is sent on `tx`.
 fn spawn_probe_round(uris: Vec<TcpPeerUri>, tx: &mpsc::Sender<(TcpPeerUri, Option<u64>)>) {
     let mut chunks: Vec<Vec<TcpPeerUri>> = (0..PROBE_WORKERS).map(|_| Vec::new()).collect();
@@ -399,7 +508,7 @@ use yggdrasil_lite::{CloseReason, ConnId, TcpEvent};
 use yggdrasil_lite::quality::{PeerView, Quality, Verdict, DEFAULT_RECHECK_MS};
 use yggdrasil_lite::search::{self, droppable, Metric, PeerSearch, SearchConfig};
 use yggdrasil_lite::address::addr_for_key;
-use yggdrasil_lite::{frame_ipv6, unframe_ipv6, udp, Action, Address, CandidateSource, Direction, Endpoint, PublicKey};
+use yggdrasil_lite::{frame_ipv6, unframe_ipv6, udp, Action, Address, CandidateSource, Direction, Endpoint, PeerInfo, PublicKey};
 
 struct Args {
     /// `--key FILE`; default: ./ygg.key if it exists, else ~/ygg.key.
@@ -467,6 +576,8 @@ struct Args {
     /// `--keep-peer URI` (repeatable): the user's own peers (`host:port`): never dropped by the
     /// peer search or the priority upgrade.
     keep_peers: Vec<String>,
+    /// `--server-peers-file PATH`: the exit server's own peers, see [`ServerPeers`].
+    server_peers_file: Option<String>,
     /// `--lan-target`: outbound slots reserved for LAN peers (default: `--target`).
     lan_target: Option<usize>,
     /// `--listen PORT`: accept inbound TCP peers and advertise this port in beacons.
@@ -513,6 +624,9 @@ downloads the public peer list and connects.
                             listed peer replaces an unlisted one every 2 min
   --keep-peer URI           the user's own peer (repeatable): never replaced by the peer
                             search or the priority upgrade
+  --server-peers-file PATH  the exit server's own peer URIs (one per line, re-read live):
+                            while one is reachable it is the only peer; when it is down for
+                            30 s the other peers are used and it is re-checked every minute
   --ckr-ctl PATH            crypto-key routing client (Yggdrasil-ng compatible): a TUN fd
                             handed over unix socket PATH at any time carries IPv4 and internet
                             IPv6 to the --connect-file server; closing the socket detaches it
@@ -564,7 +678,7 @@ fn parse_connect(spec: &str) -> Result<(u16, Ipv6Addr, u16), String> {
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { key: None, connects: Vec::new(), peers: None, allow: Vec::new(), target: 3, send: None, ping: None, html: None, api: None, html_port: HTML_PORT, quality_ms: DEFAULT_RECHECK_MS, forwards: Vec::new(), open: Vec::new(), proxy_ports: Vec::new(), rtt_limit: CLIENT_RTT_LIMIT_MS, tun: None, tun_ctl: None, tun_server: None, swap_interval: None, swap_settle: None, fwmark: 0, monitor_file: None, connect_file: None, prefer_file: None, search_file: None, socks: None, forwards_udp: Vec::new(), send_udp: None, lan_upstream: false, no_public: false, listen: None, lan_target: None, keep_peers: Vec::new(), ckr_ctl: None, ckr_tun: None, ckr_allow: None };
+    let mut a = Args { key: None, connects: Vec::new(), peers: None, allow: Vec::new(), target: 3, send: None, ping: None, html: None, api: None, html_port: HTML_PORT, quality_ms: DEFAULT_RECHECK_MS, forwards: Vec::new(), open: Vec::new(), proxy_ports: Vec::new(), rtt_limit: CLIENT_RTT_LIMIT_MS, tun: None, tun_ctl: None, tun_server: None, swap_interval: None, swap_settle: None, fwmark: 0, monitor_file: None, connect_file: None, prefer_file: None, search_file: None, socks: None, forwards_udp: Vec::new(), send_udp: None, lan_upstream: false, no_public: false, listen: None, lan_target: None, keep_peers: Vec::new(), server_peers_file: None, ckr_ctl: None, ckr_tun: None, ckr_allow: None };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         match flag.as_str() {
@@ -677,6 +791,7 @@ fn parse_args() -> Args {
                     Err(e) => eprintln!("--keep-peer {u}: {e:?}"),
                 }
             }
+            "--server-peers-file" => a.server_peers_file = Some(it.next().unwrap_or_else(|| usage())),
             "--lan-target" => a.lan_target = Some(it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
             "--listen" => a.listen = Some(it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
             "--ping" => a.ping = Some(it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
@@ -1501,6 +1616,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut prefer_text: Option<String> = None;
     let mut last_prefer_read = Instant::now() - Duration::from_secs(60);
     let mut last_upgrade = Instant::now();
+    let mut sp = ServerPeers::new();
     let mut file_target: Option<(Ipv6Addr, u16)> = None;
     let mut file_target_text: Option<String> = None;
     let mut last_target_read = Instant::now() - Duration::from_secs(10);
@@ -2313,6 +2429,19 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
+        // --server-peers-file: the exit server's own peer first, the others only while it is down.
+        if let Some(path) = &args.server_peers_file {
+            for msg in sp.tick(path, &mut ep, args.target) {
+                println!("{msg}");
+                push_swap(&mut overlay, msg);
+            }
+            for key in sp.drop.drain(..) {
+                let acts = ep.drop_peer(&key, now, 0);
+                run(acts, &mut ep, &mut streams, &mut dialer, now);
+                quality.forget(&key);
+            }
+        }
+
         // --prefer-file: the caller's peer ranking (re-read live).
         if let Some(path) = &args.prefer_file {
             if last_prefer_read.elapsed() >= Duration::from_secs(5) {
@@ -2335,7 +2464,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         .into_iter()
                         .filter(|p| p.direction == Direction::Outbound && !p.lan)
                         .filter(|p| !allow_keys.contains(&p.key) && !target_keys.contains(&p.key))
-                        .filter(|p| !p.uri.as_ref().is_some_and(|u| args.keep_peers.contains(&u.host_port())))
+                        .filter(|p| !p.uri.as_ref().is_some_and(|u| args.keep_peers.contains(&u.host_port()) || sp.ids.contains(&u.host_port())))
                         .map(|p| {
                             let rank = p.uri.as_ref().and_then(|u| ep.peer_rank(&u.host_port()));
                             (rank.map(|r| r as u64).unwrap_or(u64::MAX), p.key, p.uri.map(|u| u.host_port()).unwrap_or_default())
@@ -2384,7 +2513,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let own: Vec<PublicKey> = ep
                 .connected_peers()
                 .into_iter()
-                .filter(|p| p.uri.as_ref().is_some_and(|u| args.keep_peers.contains(&u.host_port())))
+                .filter(|p| p.uri.as_ref().is_some_and(|u| args.keep_peers.contains(&u.host_port()) || sp.ids.contains(&u.host_port())))
                 .map(|p| p.key)
                 .collect();
             let keep: Vec<PublicKey> = allow_keys.iter().chain(target_keys.iter()).chain(own.iter()).copied().collect();

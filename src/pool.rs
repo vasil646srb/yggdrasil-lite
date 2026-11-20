@@ -88,6 +88,9 @@ pub struct PeerPool {
     /// Slots `lan_from..` take only LAN-discovered candidates; the slots before it take
     /// configured ones. `None`: every slot takes any candidate.
     lan_from: Option<usize>,
+    /// While set, only these configured candidates (`host:port`) may be dialed; LAN-discovered
+    /// ones stay allowed. See [`PeerPool::set_only`].
+    only: Option<Vec<String>>,
 }
 
 impl PeerPool {
@@ -98,6 +101,7 @@ impl PeerPool {
             slots: alloc::vec![SlotState::Idle; target_outbound],
             dial_enabled: true,
             lan_from: None,
+            only: None,
         }
     }
 
@@ -117,6 +121,26 @@ impl PeerPool {
             None => true,
             Some(k) if slot >= k => source == CandidateSource::Discovered,
             Some(_) => source == CandidateSource::Config,
+        }
+    }
+
+    /// Dial only these peers (e.g. the exit server's own peer), adding unknown ones as
+    /// configured candidates; `None` lifts the limit. Connections already up are left alone.
+    pub fn set_only(&mut self, uris: Option<&[TcpPeerUri]>) {
+        self.only = uris.map(|u| {
+            for x in u {
+                self.add_candidate(x.clone(), CandidateSource::Config);
+            }
+            u.iter().map(|x| x.host_port()).collect()
+        });
+    }
+
+    /// Whether the `only` limit lets candidate `i` be dialed.
+    fn allowed(&self, i: usize) -> bool {
+        let c = &self.candidates[i];
+        match &self.only {
+            None => true,
+            Some(ids) => c.source == CandidateSource::Discovered || ids.contains(&c.uri.host_port()),
         }
     }
 
@@ -216,7 +240,7 @@ impl PeerPool {
     /// The best-ranked candidate that is not in a slot and may be dialed now.
     pub fn best_ranked_idle(&self, now_ms: u64) -> Option<(u32, TcpPeerUri)> {
         (0..self.candidates.len())
-            .filter(|&i| self.candidates[i].rank.is_some() && self.candidates[i].next_try_ms <= now_ms)
+            .filter(|&i| self.candidates[i].rank.is_some() && self.candidates[i].next_try_ms <= now_ms && self.allowed(i))
             .filter(|&i| !self.slots.iter().any(|s| slot_uses(s, i)))
             .min_by_key(|&i| self.candidates[i].score())
             .map(|i| (self.candidates[i].rank.unwrap_or(u32::MAX), self.candidates[i].uri.clone()))
@@ -250,7 +274,7 @@ impl PeerPool {
     /// Best candidate for `slot` that is off backoff and not already in a slot.
     fn best_candidate(&self, slot: SlotId, now_ms: u64) -> Option<usize> {
         (0..self.candidates.len())
-            .filter(|&i| self.accepts(slot, self.candidates[i].source))
+            .filter(|&i| self.accepts(slot, self.candidates[i].source) && self.allowed(i))
             .filter(|&i| self.candidates[i].next_try_ms <= now_ms)
             .filter(|&i| !self.slots.iter().any(|s| slot_uses(s, i)))
             .min_by_key(|&i| self.candidates[i].score())
@@ -371,6 +395,19 @@ mod tests {
 
     fn uri(s: &str) -> TcpPeerUri {
         TcpPeerUri::parse(s).unwrap()
+    }
+
+    #[test]
+    fn only_limits_dialing_to_the_listed_peers() {
+        let mut p = PeerPool::new(2);
+        p.add_candidate(uri("tcp://1.1.1.1:1"), CandidateSource::Config);
+        p.add_candidate(uri("tcp://2.2.2.2:2"), CandidateSource::Config);
+        p.set_only(Some(&[uri("tcp://9.9.9.9:9")]));
+        let d = p.schedule(0);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].1.host_port(), "9.9.9.9:9");
+        p.set_only(None);
+        assert_eq!(p.schedule(0).len(), 1); // the free slot takes another peer again
     }
 
     #[test]
