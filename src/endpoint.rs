@@ -618,6 +618,11 @@ impl Endpoint {
         self.pool.set_only(uris);
     }
 
+    /// Peers (by key) not to take as tree parent while another peer reaches the same root.
+    pub fn set_avoid_parents(&mut self, keys: &[PublicKey]) {
+        self.node.set_avoid_parents(keys);
+    }
+
     /// Hold back or release outbound dialing (see [`PeerPool::set_dial_enabled`]).
     pub fn set_dial_enabled(&mut self, on: bool) {
         self.pool.set_dial_enabled(on);
@@ -655,6 +660,11 @@ impl Endpoint {
     }
 
     /// Spanning-tree root key (for status output).
+    /// Our parent in the spanning tree (`None` while we are the root).
+    pub fn parent(&self) -> Option<PublicKey> {
+        self.node.tree().get_parent()
+    }
+
     pub fn root(&self) -> PublicKey {
         self.node.root()
     }

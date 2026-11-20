@@ -363,13 +363,19 @@ fn probe_tcp(uri: &TcpPeerUri) -> Option<u64> {
 /// node dials only those and drops its other outbound peers (LAN peers stay), so the path to
 /// the server is direct. When none is up for [`SERVER_PEER_GRACE`] the limit is lifted and the
 /// usual peers take over; a TCP probe every [`SERVER_PEER_RECHECK`] brings it back.
+///
+/// The exit is a leaf: it does not forward traffic, so the trackers (`--search-file`) and the
+/// rest of the network are out of reach through it. With `--target` 2 or more one more peer is
+/// kept next to it: a `tcp://` peer picked by the ping to the trackers (up to
+/// [`TRACKER_TRIALS`] candidates are tried in turn, the fastest stays). While that peer is up
+/// the exit is never our tree parent: the network reaches us through the other one.
 struct ServerPeers {
     text: Option<String>,
     last_read: Instant,
     uris: Vec<TcpPeerUri>,
     /// `host:port` of `uris`.
     ids: Vec<String>,
-    /// Only the server's peers are dialed.
+    /// Only the server's peers (and `extra`) are dialed.
     only: bool,
     /// Last time one of them was up (or `only` began).
     last_up: Instant,
@@ -377,25 +383,166 @@ struct ServerPeers {
     probe: Option<mpsc::Receiver<bool>>,
     /// Outbound peers to drop now (filled by `tick`).
     drop: Vec<PublicKey>,
+    /// The peer towards the trackers (on trial or chosen).
+    extra: Option<TcpPeerUri>,
+    /// Trial of `extra`: started at, and when it connected (protocol clock).
+    trial: Option<(Instant, Option<u64>)>,
+    /// Trial results: ping to the trackers through each candidate (`None`: no answer).
+    results: Vec<(TcpPeerUri, Option<u64>)>,
+    /// When the trials last ended (the choice is reviewed after [`TRACKER_REVIEW`]).
+    chosen_at: Option<Instant>,
+    /// Last time a tracker answered through the chosen peer.
+    tracker_ok: Instant,
 }
 
 const SERVER_PEER_GRACE: Duration = Duration::from_secs(30);
 const SERVER_PEER_RECHECK: Duration = Duration::from_secs(60);
+/// Peers tried as the way to the trackers before the fastest is kept.
+const TRACKER_TRIALS: usize = 3;
+/// How long one candidate gets to bring a tracker answer.
+const TRACKER_TRIAL: Duration = Duration::from_secs(60);
+/// The choice is redone this often, or after [`TRACKER_LOST`] without an answer (but not
+/// sooner than [`TRACKER_RETRY`] after the last choice).
+const TRACKER_REVIEW: Duration = Duration::from_secs(30 * 60);
+const TRACKER_LOST: Duration = Duration::from_secs(120);
+const TRACKER_RETRY: Duration = Duration::from_secs(5 * 60);
 
 impl ServerPeers {
     fn new() -> Self {
         let now = Instant::now();
-        Self { text: None, last_read: now - Duration::from_secs(60), uris: Vec::new(), ids: Vec::new(), only: false, last_up: now, next_probe: now, probe: None, drop: Vec::new() }
+        Self {
+            text: None,
+            last_read: now - Duration::from_secs(60),
+            uris: Vec::new(),
+            ids: Vec::new(),
+            only: false,
+            last_up: now,
+            next_probe: now,
+            probe: None,
+            drop: Vec::new(),
+            extra: None,
+            trial: None,
+            results: Vec::new(),
+            chosen_at: None,
+            tracker_ok: now,
+        }
     }
 
     fn set_only(&mut self, ep: &mut Endpoint, on: bool) {
         self.only = on;
         self.last_up = Instant::now();
-        ep.set_only_peers(if on { Some(&self.uris) } else { None });
+        self.apply(ep);
+    }
+
+    /// Hand the dial limit to the pool: the server's peers and the peer towards the trackers.
+    fn apply(&self, ep: &mut Endpoint) {
+        if self.only {
+            let mut list = self.uris.clone();
+            list.extend(self.extra.iter().cloned());
+            ep.set_only_peers(Some(&list));
+        } else {
+            ep.set_only_peers(None);
+        }
+    }
+
+    /// A peer this mode keeps: the server's own, or (while only those are used) the way to
+    /// the trackers. The peer search and the priority upgrade leave them alone.
+    fn keeps(&self, host_port: &str) -> bool {
+        self.ids.iter().any(|i| i == host_port) || (self.only && self.extra.as_ref().is_some_and(|u| u.host_port() == host_port))
+    }
+
+    /// Next `tcp://` candidate to try towards the trackers: not the server's, not tried yet,
+    /// lowest TCP probe time first.
+    fn next_candidate(&self, ep: &Endpoint) -> Option<TcpPeerUri> {
+        let mut c: Vec<_> = ep
+            .candidates()
+            .into_iter()
+            .filter(|c| c.source == CandidateSource::Config && !c.uri.is_tls() && c.failures < 3)
+            .filter(|c| !self.ids.contains(&c.uri.host_port()) && !self.results.iter().any(|(u, _)| u.host_port() == c.uri.host_port()))
+            .collect();
+        c.sort_by_key(|c| c.rtt_ms.unwrap_or(u64::MAX));
+        c.into_iter().next().map(|c| c.uri)
+    }
+
+    fn start_trial(&mut self, ep: &mut Endpoint, uri: TcpPeerUri, log: &mut Vec<String>) {
+        log.push(format!("пир к трекеру: пробую {}", uri.host_port()));
+        self.extra = Some(uri);
+        self.trial = Some((Instant::now(), None));
+        self.apply(ep);
+    }
+
+    /// The peer towards the trackers, while the server's peer is up. `tracker`: the freshest
+    /// best ping to a tracker; `extra_up`: the current candidate is connected.
+    fn tracker_step(&mut self, ep: &mut Endpoint, now: u64, tracker: Option<RttMon>, extra_up: bool) -> Vec<String> {
+        let mut log = Vec::new();
+        if let Some((t0, up_at)) = self.trial {
+            let up_at = match up_at {
+                None if extra_up => {
+                    self.trial = Some((t0, Some(now)));
+                    Some(now)
+                }
+                x => x,
+            };
+            // An answer that left after the candidate connected (the server does not forward,
+            // so it came through the candidate).
+            let got = tracker.filter(|m| up_at.is_some_and(|u| m.at > u + 1000)).map(|m| m.last);
+            if got.is_none() && t0.elapsed() < TRACKER_TRIAL {
+                return log;
+            }
+            let uri = self.extra.take().expect("a trial has a candidate");
+            log.push(match got {
+                Some(ms) => format!("пир к трекеру: {} — {ms} мс", uri.host_port()),
+                None => format!("пир к трекеру: {} — трекер не ответил", uri.host_port()),
+            });
+            self.results.push((uri, got));
+            self.trial = None;
+            if self.results.len() < TRACKER_TRIALS {
+                if let Some(next) = self.next_candidate(ep) {
+                    self.start_trial(ep, next, &mut log);
+                    return log;
+                }
+            }
+            // Done: the fastest (else the first tried, it at least was the best by TCP probe).
+            let best = self.results.iter().filter(|r| r.1.is_some()).min_by_key(|r| r.1).or(self.results.first()).cloned();
+            if let Some((uri, ms)) = best {
+                log.push(match ms {
+                    Some(ms) => format!("пир к трекеру: выбран {} ({ms} мс)", uri.host_port()),
+                    None => format!("пир к трекеру: трекер не ответил ни через один, оставлен {}", uri.host_port()),
+                });
+                self.extra = Some(uri);
+            }
+            self.chosen_at = Some(Instant::now());
+            self.tracker_ok = Instant::now();
+            self.apply(ep);
+            return log;
+        }
+        match self.chosen_at {
+            None => {
+                if let Some(next) = self.next_candidate(ep) {
+                    self.start_trial(ep, next, &mut log);
+                }
+            }
+            Some(at) => {
+                if tracker.is_some_and(|m| now.saturating_sub(m.at) < 30_000) {
+                    self.tracker_ok = Instant::now();
+                }
+                let lost = self.tracker_ok.elapsed() >= TRACKER_LOST && at.elapsed() >= TRACKER_RETRY;
+                if lost || at.elapsed() >= TRACKER_REVIEW {
+                    log.push(if lost { "пир к трекеру: трекер не отвечает — подбираю заново".to_string() } else { "пир к трекеру: плановый повторный подбор".to_string() });
+                    self.results.clear();
+                    self.chosen_at = None;
+                    match self.next_candidate(ep) {
+                        Some(next) => self.start_trial(ep, next, &mut log),
+                        None => self.chosen_at = Some(Instant::now()),
+                    }
+                }
+            }
+        }
+        log
     }
 
     /// Re-read the file, switch modes; returns log lines.
-    fn tick(&mut self, path: &str, ep: &mut Endpoint, target: usize) -> Vec<String> {
+    fn tick(&mut self, path: &str, ep: &mut Endpoint, target: usize, now: u64, tracker: Option<RttMon>, trackers: bool) -> Vec<String> {
         let mut log = Vec::new();
         if self.last_read.elapsed() >= Duration::from_secs(3) {
             self.last_read = Instant::now();
@@ -422,14 +569,25 @@ impl ServerPeers {
         let peers = ep.connected_peers();
         let outbound: Vec<_> = peers.iter().filter(|p| p.direction == Direction::Outbound && !p.lan).collect();
         let is_server = |p: &&PeerInfo| p.uri.as_ref().is_some_and(|u| self.ids.contains(&u.host_port()));
+        let extra_hp = self.extra.as_ref().map(|u| u.host_port());
+        let is_extra = |p: &&PeerInfo| extra_hp.is_some() && p.uri.as_ref().map(|u| u.host_port()) == extra_hp;
         let up = outbound.iter().any(is_server);
+        // The exit does not forward: with another peer up it must not be our tree parent, or
+        // the trackers' answers (and anyone else) could not find us.
+        let mut avoid: Vec<PublicKey> = if self.only && outbound.iter().any(is_extra) { outbound.iter().filter(|p| is_server(p)).map(|p| p.key).collect() } else { Vec::new() };
+        avoid.sort();
+        ep.set_avoid_parents(&avoid);
         if self.only {
-            let others: Vec<PublicKey> = outbound.iter().filter(|p| !is_server(p)).map(|p| p.key).collect();
+            let extra_up = outbound.iter().any(is_extra);
+            let others: Vec<PublicKey> = outbound.iter().filter(|p| !is_server(p) && !is_extra(p)).map(|p| p.key).collect();
             if up {
                 self.last_up = Instant::now();
                 if !others.is_empty() {
                     log.push(format!("пир сервера подключён: остальные пиры ({}) отключены", others.len()));
                     self.drop = others;
+                }
+                if target >= 2 && trackers {
+                    log.extend(self.tracker_step(ep, now, tracker, extra_up));
                 }
             } else if self.last_up.elapsed() >= SERVER_PEER_GRACE {
                 log.push(format!("пир сервера недоступен — обычные пиры, проверка раз в {} с", SERVER_PEER_RECHECK.as_secs()));
@@ -625,8 +783,10 @@ downloads the public peer list and connects.
   --keep-peer URI           the user's own peer (repeatable): never replaced by the peer
                             search or the priority upgrade
   --server-peers-file PATH  the exit server's own peer URIs (one per line, re-read live):
-                            while one is reachable it is the only peer; when it is down for
-                            30 s the other peers are used and it is re-checked every minute
+                            while one is reachable it is the only peer (plus, with --target 2+
+                            and --search-file, one tcp:// peer with the best ping to the
+                            trackers: the exit does not forward); when it is down for 30 s the
+                            other peers are used and it is re-checked every minute
   --ckr-ctl PATH            crypto-key routing client (Yggdrasil-ng compatible): a TUN fd
                             handed over unix socket PATH at any time carries IPv4 and internet
                             IPv6 to the --connect-file server; closing the socket detaches it
@@ -1433,22 +1593,67 @@ fn run(actions: Vec<Action>, ep: &mut Endpoint, streams: &mut HashMap<usize, Str
         match action {
             Action::Dial { slot, uri } => dialer.start(slot, uri),
             Action::Write { slot, data } => {
-                if let Some(s) = streams.get_mut(&slot) {
+                if streams.contains_key(&slot) {
                     PEER_TX.with(|m| *m.borrow_mut().entry(slot).or_default() += data.len() as u64);
-                    if let Err(e) = s.write_all(&data) {
-                        eprintln!("write to slot {slot} failed: {e} ({:?})", e.kind());
-                        streams.remove(&slot);
-                        ep.on_transport_closed(slot, now);
+                    // Gathered and written once per loop pass (see `flush_peers`): one system
+                    // call and a few full TCP segments instead of one per packet.
+                    let full = PEER_OUT.with(|m| {
+                        let mut m = m.borrow_mut();
+                        let b = m.entry(slot).or_default();
+                        b.extend_from_slice(&data);
+                        b.len() >= PEER_OUT_MAX
+                    });
+                    if full {
+                        flush_slot(slot, ep, streams, now);
                     }
                 }
             }
             Action::Close { slot } => {
+                flush_slot(slot, ep, streams, now);
                 dialer.cancel(slot);
                 if let Some(mut s) = streams.remove(&slot) {
                     s.shutdown();
                 }
             }
         }
+    }
+}
+
+/// Bytes gathered for one peer before they are written right away.
+const PEER_OUT_MAX: usize = 16 * 1024;
+
+/// Write what [`run`] gathered for `slot`.
+fn flush_slot(slot: usize, ep: &mut Endpoint, streams: &mut HashMap<usize, Stream>, now: u64) {
+    // The buffer goes back into the map afterwards: its memory is reused for the next pass.
+    let Some(mut data) = PEER_OUT.with(|m| m.borrow_mut().get_mut(&slot).map(std::mem::take)) else { return };
+    if data.is_empty() {
+        return;
+    }
+    let mut closed = false;
+    if let Some(s) = streams.get_mut(&slot) {
+        if let Err(e) = s.write_all(&data) {
+            eprintln!("write to slot {slot} failed: {e} ({:?})", e.kind());
+            streams.remove(&slot);
+            ep.on_transport_closed(slot, now);
+            closed = true;
+        }
+    }
+    data.clear();
+    PEER_OUT.with(|m| {
+        let mut m = m.borrow_mut();
+        if closed || !streams.contains_key(&slot) {
+            m.remove(&slot);
+        } else {
+            m.insert(slot, data);
+        }
+    });
+}
+
+/// Write everything gathered for the peers (before the loop waits).
+fn flush_peers(ep: &mut Endpoint, streams: &mut HashMap<usize, Stream>, now: u64) {
+    let slots: Vec<usize> = PEER_OUT.with(|m| m.borrow().iter().filter(|(_, b)| !b.is_empty()).map(|(s, _)| *s).collect());
+    for slot in slots {
+        flush_slot(slot, ep, streams, now);
     }
 }
 
@@ -1775,6 +1980,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let now = clock(start);
         let actions = ep.poll(now, &mut rng);
         run(actions, &mut ep, &mut streams, &mut dialer, now);
+        flush_peers(&mut ep, &mut streams, now);
 
         // Dials that finished on their worker threads.
         while let Ok(done) = dialer.rx.try_recv() {
@@ -1928,6 +2134,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
         }
+
+        // Replies to what the peers just sent (acks, pongs) go out before the local work.
+        flush_peers(&mut ep, &mut streams, now);
 
         while let Some(msg) = ep.recv() {
             // Round trips are measured with the clock read now, not the loop pass's `now`: a pass
@@ -2359,6 +2568,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
+        flush_peers(&mut ep, &mut streams, now);
+
         if last_probe.elapsed() >= PEER_PROBE_INTERVAL {
             last_probe = Instant::now();
             for p in ep.connected_peers().into_iter().filter(|p| p.direction == Direction::Outbound) {
@@ -2416,7 +2627,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     finder.forget_client(&SEARCH_KEY);
                     search_text = Some(text);
                 }
-                if targets.is_empty() {
+                // Also while only the exit's peer is used: the ping picks the way to the trackers.
+                if targets.is_empty() || sp.only {
                     for a in &search_targets {
                         let nonce = new_nonce(&mut rng);
                         let acts = ep.ping_payload(&Address(*a), QUALITY_ID, SEARCH_PROBE_SEQ, &nonce, now, &mut rng);
@@ -2431,7 +2643,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         // --server-peers-file: the exit server's own peer first, the others only while it is down.
         if let Some(path) = &args.server_peers_file {
-            for msg in sp.tick(path, &mut ep, args.target) {
+            let fresh = |m: &&RttMon| m.at > 0 && now.saturating_sub(m.at) < 30_000;
+            let tracker = search_targets.iter().filter_map(|a| rtts.get(a)).filter(fresh).min_by_key(|m| m.last).copied();
+            for msg in sp.tick(path, &mut ep, args.target, now, tracker, !search_targets.is_empty()) {
                 println!("{msg}");
                 push_swap(&mut overlay, msg);
             }
@@ -2464,7 +2678,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         .into_iter()
                         .filter(|p| p.direction == Direction::Outbound && !p.lan)
                         .filter(|p| !allow_keys.contains(&p.key) && !target_keys.contains(&p.key))
-                        .filter(|p| !p.uri.as_ref().is_some_and(|u| args.keep_peers.contains(&u.host_port()) || sp.ids.contains(&u.host_port())))
+                        .filter(|p| !p.uri.as_ref().is_some_and(|u| args.keep_peers.contains(&u.host_port()) || sp.keeps(&u.host_port())))
                         .map(|p| {
                             let rank = p.uri.as_ref().and_then(|u| ep.peer_rank(&u.host_port()));
                             (rank.map(|r| r as u64).unwrap_or(u64::MAX), p.key, p.uri.map(|u| u.host_port()).unwrap_or_default())
@@ -2513,7 +2727,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let own: Vec<PublicKey> = ep
                 .connected_peers()
                 .into_iter()
-                .filter(|p| p.uri.as_ref().is_some_and(|u| args.keep_peers.contains(&u.host_port()) || sp.ids.contains(&u.host_port())))
+                .filter(|p| p.uri.as_ref().is_some_and(|u| args.keep_peers.contains(&u.host_port()) || sp.keeps(&u.host_port())))
                 .map(|p| p.key)
                 .collect();
             let keep: Vec<PublicKey> = allow_keys.iter().chain(target_keys.iter()).chain(own.iter()).copied().collect();
@@ -2685,6 +2899,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             poller.add(b.sock.as_raw_fd(), events);
         }
+        flush_peers(&mut ep, &mut streams, clock(start));
         poller.wait(wait_ms);
         prev_ready = poller.any_ready();
         ready_slots.clear();
@@ -2811,6 +3026,8 @@ thread_local! {
     /// Bytes read from / written to each peer transport slot (main loop thread only).
     static PEER_RX: std::cell::RefCell<HashMap<usize, u64>> = std::cell::RefCell::new(HashMap::new());
     static PEER_TX: std::cell::RefCell<HashMap<usize, u64>> = std::cell::RefCell::new(HashMap::new());
+    /// Peer writes gathered during one loop pass (see `flush_peers`).
+    static PEER_OUT: std::cell::RefCell<HashMap<usize, Vec<u8>>> = std::cell::RefCell::new(HashMap::new());
 }
 
 /// Per-peer traffic of the current session on a slot, for `/api/peers`.

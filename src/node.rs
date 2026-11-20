@@ -951,6 +951,12 @@ impl YggdrasilLite {
         }
     }
 
+    /// Peers not to take as tree parent while another peer reaches the same root, e.g. an exit
+    /// that does not forward: under it nobody could reach us through the tree.
+    pub fn set_avoid_parents(&mut self, keys: &[PublicKey]) {
+        self.tree.set_avoid_parents(keys);
+    }
+
     /// Mark a peer as no-redistribute: its keys (recv bloom) are never merged
     /// into blooms advertised to other peers, and lookups from other peers are
     /// never forwarded toward it. Our own lookups still use it. Marking every

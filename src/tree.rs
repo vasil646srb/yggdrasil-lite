@@ -169,7 +169,13 @@ pub struct LeafTree {
     dirty: bool,
     do_root1: bool,
     do_root2: bool,
+    /// Peers taken as parent only when nothing else offers a path to the same root (see
+    /// [`LeafTree::set_avoid_parents`]).
+    avoid: Vec<PublicKey>,
 }
+
+/// Cost factor for an avoided parent: any other peer to the same root wins.
+const AVOID_PENALTY: u64 = 1 << 20;
 
 impl LeafTree {
     pub fn new(our_key: PublicKey) -> Self {
@@ -185,6 +191,25 @@ impl LeafTree {
             dirty: false,
             do_root1: false,
             do_root2: true, // become root on first maintenance
+            avoid: Vec::new(),
+        }
+    }
+
+    /// Peers not to take as parent while another peer reaches the same root, e.g. a peer that
+    /// does not forward traffic (a leaf): under it nobody could reach us through the tree.
+    /// A change takes effect on the next maintenance pass.
+    pub fn set_avoid_parents(&mut self, keys: &[PublicKey]) {
+        if self.avoid.as_slice() != keys {
+            self.avoid = keys.to_vec();
+            self.needs_refresh = true;
+        }
+    }
+
+    fn parent_cost(&self, key: &PublicKey, cost: u64) -> u64 {
+        if self.avoid.contains(key) {
+            cost.max(1).saturating_mul(AVOID_PENALTY)
+        } else {
+            cost
         }
     }
 
@@ -491,7 +516,7 @@ impl LeafTree {
                 }
                 best_root = root;
                 best_parent = self_info_parent;
-                best_cost = cost;
+                best_cost = self.parent_cost(&self_info_parent, cost);
             }
         }
 
@@ -523,6 +548,7 @@ impl LeafTree {
                 }
             }
 
+            let cost = self.parent_cost(&pk, cost);
             if p_root < best_root {
                 best_root = p_root;
                 best_parent = pk;
@@ -533,8 +559,10 @@ impl LeafTree {
 
             // During refresh: require significantly better cost (2x) to switch
             // Otherwise: just pick the lower-cost candidate
+            // An avoided parent gives way at once, not only on the next refresh.
             if (self.needs_refresh && cost.saturating_mul(2) < best_cost)
                 || (best_parent != self_info_parent && cost < best_cost)
+                || (self.avoid.contains(&best_parent) && cost < best_cost)
             {
                 best_root = p_root;
                 best_parent = pk;
@@ -1184,6 +1212,47 @@ mod tests {
 
         let has_announce = actions.iter().any(|a| matches!(a, TreeAction::SendAnnounce { .. }));
         assert!(has_announce, "should send our root announcement to peer");
+    }
+
+    #[test]
+    fn avoided_parent_is_used_only_without_another() {
+        let mut cryptos: Vec<Crypto> = (0..4).map(|_| make_crypto()).collect();
+        cryptos.sort_by(|a, b| a.public_key.cmp(&b.public_key));
+        // [0] root, [1] fast peer to avoid, [2] slower peer, [3] our node (highest key).
+        let (root, fast, slow, me) = (&cryptos[0], &cryptos[1], &cryptos[2], &cryptos[3]);
+        let mut tree = LeafTree::new(me.public_key);
+        let sig = root.sign(&announcement_sig_bytes(&root.public_key, &root.public_key, 1, 0, 0));
+        tree.update_info(root.public_key, root.public_key, 1, 0, 0, sig, sig);
+        for (i, c) in [fast, slow].iter().enumerate() {
+            let port = i as PeerPort + 1;
+            let bs = announcement_sig_bytes(&c.public_key, &root.public_key, 1, 0, port);
+            let (psig, sig) = (root.sign(&bs), c.sign(&bs));
+            tree.update_info(c.public_key, root.public_key, 1, 0, port, psig, sig);
+        }
+        let pick = |tree: &mut LeafTree, refresh: bool| {
+            let req = tree.new_sig_req(random_nonce());
+            for (port, c) in [(1, fast), (2, slow)] {
+                let bs = announcement_sig_bytes(&me.public_key, &c.public_key, req.seq, req.nonce, port);
+                tree.handle_sig_res(c.public_key, &wire::SigRes { seq: req.seq, nonce: req.nonce, port, psig: c.sign(&bs) });
+            }
+            let peers = [(1u32, fast.public_key, 5u64), (2u32, slow.public_key, 50u64)];
+            if refresh {
+                tree.set_needs_refresh();
+            }
+            let _ = tree.do_maintenance(&me, &peers, random_nonce());
+            tree.get_info(&me.public_key).unwrap().parent
+        };
+        tree.add_peer(fast.public_key);
+        tree.add_peer(slow.public_key);
+        assert_eq!(pick(&mut tree, true), fast.public_key, "lower latency wins normally");
+        tree.set_avoid_parents(&[fast.public_key]);
+        assert_eq!(pick(&mut tree, true), slow.public_key, "the avoided peer gives way");
+        tree.set_avoid_parents(&[]);
+        assert_eq!(pick(&mut tree, true), fast.public_key);
+        // Outside a refresh too: the answers of a new request arrive after the refresh.
+        tree.set_avoid_parents(&[fast.public_key]);
+        let _ = tree.do_maintenance(&me, &[], random_nonce()); // consumes the refresh
+        assert_eq!(pick(&mut tree, false), slow.public_key);
     }
 
     #[test]
