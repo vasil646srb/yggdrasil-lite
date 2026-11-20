@@ -361,7 +361,8 @@ fn probe_tcp(uri: &TcpPeerUri) -> Option<u64> {
 
 /// The exit server's own peers (`--server-peers-file`): while one of them is reachable the
 /// node dials only those and drops its other outbound peers (LAN peers stay), so the path to
-/// the server is direct. When none is up for [`SERVER_PEER_GRACE`] the limit is lifted and the
+/// the server is direct. IPv4 is tried first; its IPv6 addresses only after
+/// [`SERVER_PEER_V4_WAIT`] without a connection. When none is up for [`SERVER_PEER_GRACE`] the limit is lifted and the
 /// usual peers take over; a TCP probe every [`SERVER_PEER_RECHECK`] brings it back.
 ///
 /// The exit is a leaf: it does not forward traffic, so the trackers (`--search-file`) and the
@@ -377,6 +378,9 @@ struct ServerPeers {
     ids: Vec<String>,
     /// Only the server's peers (and `extra`) are dialed.
     only: bool,
+    /// The server's IPv6 addresses are dialed (its IPv4 ones did not connect in
+    /// [`SERVER_PEER_V4_WAIT`]); IPv4 first on every start of the mode.
+    v6: bool,
     /// Last time one of them was up (or `only` began).
     last_up: Instant,
     next_probe: Instant,
@@ -396,6 +400,9 @@ struct ServerPeers {
 }
 
 const SERVER_PEER_GRACE: Duration = Duration::from_secs(30);
+/// How long the server's IPv4 peer gets before its IPv6 one is tried (the rest of
+/// [`SERVER_PEER_GRACE`] is for IPv6, then the usual peers).
+const SERVER_PEER_V4_WAIT: Duration = Duration::from_secs(15);
 const SERVER_PEER_RECHECK: Duration = Duration::from_secs(60);
 /// Peers tried as the way to the trackers before the fastest is kept.
 const TRACKER_TRIALS: usize = 3;
@@ -416,6 +423,7 @@ impl ServerPeers {
             uris: Vec::new(),
             ids: Vec::new(),
             only: false,
+            v6: false,
             last_up: now,
             next_probe: now,
             probe: None,
@@ -430,14 +438,31 @@ impl ServerPeers {
 
     fn set_only(&mut self, ep: &mut Endpoint, on: bool) {
         self.only = on;
+        self.v6 = false;
         self.last_up = Instant::now();
         self.apply(ep);
+    }
+
+    /// The server's peers by address family: IPv4 (and names) or IPv6 literals.
+    fn family(&self, v6: bool) -> Vec<TcpPeerUri> {
+        self.uris.iter().filter(|u| u.host().parse::<Ipv6Addr>().is_ok() == v6).cloned().collect()
+    }
+
+    /// The server's peers dialed now: IPv4 first, IPv6 only when IPv4 did not connect (or
+    /// there is none).
+    fn dialed(&self) -> Vec<TcpPeerUri> {
+        let v4 = self.family(false);
+        if self.v6 || v4.is_empty() {
+            self.family(true)
+        } else {
+            v4
+        }
     }
 
     /// Hand the dial limit to the pool: the server's peers and the peer towards the trackers.
     fn apply(&self, ep: &mut Endpoint) {
         if self.only {
-            let mut list = self.uris.clone();
+            let mut list = self.dialed();
             list.extend(self.extra.iter().cloned());
             ep.set_only_peers(Some(&list));
         } else {
@@ -589,8 +614,12 @@ impl ServerPeers {
                 if target >= 2 && trackers {
                     log.extend(self.tracker_step(ep, now, tracker, extra_up));
                 }
+            } else if !self.v6 && self.last_up.elapsed() >= SERVER_PEER_V4_WAIT && !self.family(false).is_empty() && !self.family(true).is_empty() {
+                log.push("пир сервера по IPv4 не подключается — пробую IPv6".to_string());
+                self.v6 = true;
+                self.apply(ep);
             } else if self.last_up.elapsed() >= SERVER_PEER_GRACE {
-                log.push(format!("пир сервера недоступен — обычные пиры, проверка раз в {} с", SERVER_PEER_RECHECK.as_secs()));
+                log.push(format!("пир сервера недоступен ни по IPv4, ни по IPv6 — обычные пиры, проверка раз в {} с", SERVER_PEER_RECHECK.as_secs()));
                 self.set_only(ep, false);
                 self.next_probe = Instant::now() + SERVER_PEER_RECHECK;
             } else if outbound.len() >= target && !others.is_empty() {
@@ -783,7 +812,8 @@ downloads the public peer list and connects.
   --keep-peer URI           the user's own peer (repeatable): never replaced by the peer
                             search or the priority upgrade
   --server-peers-file PATH  the exit server's own peer URIs (one per line, re-read live):
-                            while one is reachable it is the only peer (plus, with --target 2+
+                            while one is reachable it is the only peer, IPv4 first, IPv6
+                            after 15 s without a connection (plus, with --target 2+
                             and --search-file, one tcp:// peer with the best ping to the
                             trackers: the exit does not forward); when it is down for 30 s the
                             other peers are used and it is re-checked every minute
