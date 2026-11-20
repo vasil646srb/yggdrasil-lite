@@ -618,6 +618,12 @@ impl Endpoint {
         self.pool.set_only(uris);
     }
 
+    /// Wall-clock time (ms) at which the `now_ms` passed in was zero (session init sequence
+    /// numbers then stay increasing across restarts, as in Yggdrasil).
+    pub fn set_clock_base(&mut self, unix_ms: u64) {
+        self.node.set_clock_base(unix_ms);
+    }
+
     /// Peers (by key) not to take as tree parent while another peer reaches the same root.
     pub fn set_avoid_parents(&mut self, keys: &[PublicKey]) {
         self.node.set_avoid_parents(keys);

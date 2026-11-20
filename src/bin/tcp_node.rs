@@ -368,8 +368,9 @@ fn probe_tcp(uri: &TcpPeerUri) -> Option<u64> {
 /// The exit is a leaf: it does not forward traffic, so the trackers (`--search-file`) and the
 /// rest of the network are out of reach through it. With `--target` 2 or more one more peer is
 /// kept next to it: a `tcp://` peer picked by the ping to the trackers (up to
-/// [`TRACKER_TRIALS`] candidates are tried in turn, the fastest stays). While that peer is up
-/// the exit is never our tree parent: the network reaches us through the other one.
+/// [`TRACKER_TRIALS`] candidates are tried in turn, the fastest stays). The exit is never our
+/// tree parent while another peer is up (see the main loop): the network reaches us through
+/// the other one.
 struct ServerPeers {
     text: Option<String>,
     last_read: Instant,
@@ -597,11 +598,6 @@ impl ServerPeers {
         let extra_hp = self.extra.as_ref().map(|u| u.host_port());
         let is_extra = |p: &&PeerInfo| extra_hp.is_some() && p.uri.as_ref().map(|u| u.host_port()) == extra_hp;
         let up = outbound.iter().any(is_server);
-        // The exit does not forward: with another peer up it must not be our tree parent, or
-        // the trackers' answers (and anyone else) could not find us.
-        let mut avoid: Vec<PublicKey> = if self.only && outbound.iter().any(is_extra) { outbound.iter().filter(|p| is_server(p)).map(|p| p.key).collect() } else { Vec::new() };
-        avoid.sort();
-        ep.set_avoid_parents(&avoid);
         if self.only {
             let extra_up = outbound.iter().any(is_extra);
             let others: Vec<PublicKey> = outbound.iter().filter(|p| !is_server(p) && !is_extra(p)).map(|p| p.key).collect();
@@ -1625,6 +1621,7 @@ fn run(actions: Vec<Action>, ep: &mut Endpoint, streams: &mut HashMap<usize, Str
             Action::Write { slot, data } => {
                 if streams.contains_key(&slot) {
                     PEER_TX.with(|m| *m.borrow_mut().entry(slot).or_default() += data.len() as u64);
+                    tx_debug(slot, &data);
                     // Gathered and written once per loop pass (see `flush_peers`): one system
                     // call and a few full TCP segments instead of one per packet.
                     let full = PEER_OUT.with(|m| {
@@ -1647,6 +1644,26 @@ fn run(actions: Vec<Action>, ep: &mut Endpoint, streams: &mut HashMap<usize, Str
             }
         }
     }
+}
+
+/// Debug: frames sent per peer slot by packet type, while `<key dir>/txdebug` exists (dumped
+/// to `txdebug.out` every 10 s). Off: one thread-local flag check per write.
+fn tx_debug(slot: usize, data: &[u8]) {
+    if !TX_DEBUG_ON.with(|f| f.get()) {
+        return;
+    }
+    // uvarint length, then the type byte
+    let mut i = 0;
+    while i < data.len() && data[i] & 0x80 != 0 {
+        i += 1;
+    }
+    let t = data.get(i + 1).copied().unwrap_or(255);
+    TX_DEBUG.with(|m| {
+        let mut m = m.borrow_mut();
+        let e = m.entry((slot, t)).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += data.len() as u64;
+    });
 }
 
 /// Bytes gathered for one peer before they are written right away.
@@ -1887,8 +1904,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut streams: HashMap<usize, Stream> = HashMap::new();
     let mut dialer = Dialer::new();
     let start = Instant::now();
+    // `clock(start)` starts now: session inits carry wall-clock-based sequence numbers, so after
+    // a restart our peers' sessions with us renew at once instead of ignoring our inits.
+    let unix_now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
     // Start the protocol clock away from zero, as the library tests do.
     let clock = |start: Instant| CLOCK_BASE + start.elapsed().as_millis() as u64;
+    ep.set_clock_base(unix_now.saturating_sub(clock(start)));
     let mut last_status = Instant::now() - Duration::from_secs(10);
     let mut last_snap = Instant::now() - Duration::from_secs(10);
     let mut quality = Quality::new(args.quality_ms);
@@ -2247,8 +2268,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                                     search_sent.remove(&a);
                                     let sample = rx.saturating_sub(sent);
                                     rtts.entry(a).or_default().record(sample, rx);
-                                    // Only without a server: then the server's ping decides.
-                                    if targets.is_empty() {
+                                    // Only without a server: then the server's ping decides. Not on a
+                                    // node that takes peers (--listen, an exit): the trackers' ping
+                                    // says nothing about its clients, and a busy tracker link would
+                                    // make it drop the peers its clients reach it through.
+                                    if targets.is_empty() && args.listen.is_none() {
                                         finder.record_client(&SEARCH_KEY, sample, rx);
                                     }
                                 }
@@ -2681,6 +2705,26 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
+        // Tree parent: never a node that does not forward while another peer is up, or nobody
+        // could reach us through the tree. Such are the exit's own peer (sp) and our inbound
+        // peers (clients: phones, PCs, other tcp_node leaves).
+        {
+            let peers = ep.connected_peers();
+            let is_sp = |p: &PeerInfo| p.uri.as_ref().is_some_and(|u| sp.ids.contains(&u.host_port()));
+            let out_any = peers.iter().any(|p| p.direction == Direction::Outbound);
+            let other_out = peers.iter().any(|p| p.direction == Direction::Outbound && !is_sp(p));
+            // LAN tcp:// peers are tcp_node leaves too (yggdrasil-go LAN peers are dialed over TLS).
+            let leaf_lan = |p: &PeerInfo| p.lan && p.uri.as_ref().is_some_and(|u| !u.is_tls());
+            let wan_out = peers.iter().any(|p| p.direction == Direction::Outbound && !is_sp(p) && !leaf_lan(p));
+            let mut avoid: Vec<PublicKey> = peers
+                .iter()
+                .filter(|p| (p.direction != Direction::Outbound && out_any) || (is_sp(p) && other_out) || (leaf_lan(p) && wan_out))
+                .map(|p| p.key)
+                .collect();
+            avoid.sort();
+            ep.set_avoid_parents(&avoid);
+        }
+
         // --server-peers-file: the exit server's own peer first, the others only while it is down.
         if let Some(path) = &args.server_peers_file {
             let fresh = |m: &&RttMon| m.at > 0 && now.saturating_sub(m.at) < 30_000;
@@ -2859,6 +2903,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!("STAT tun tx={ckr_tx} rx={ckr_rx}");
         }
         if last_status.elapsed() >= Duration::from_secs(10) {
+            let dbg = std::path::Path::new(&key_path).with_file_name("txdebug");
+            let on = dbg.exists();
+            TX_DEBUG_ON.with(|f| f.set(on));
+            if on {
+                let peers: HashMap<usize, String> = ep.connected_peers().into_iter().map(|p| (p.slot, p.uri.map(|u| u.host_port()).unwrap_or_else(|| "in".into()))).collect();
+                let mut rows: Vec<_> = TX_DEBUG.with(|m| m.borrow_mut().drain().collect());
+                rows.sort();
+                let text: String = rows.iter().map(|((slot, t), (n, b))| format!("{} type {t}: {n} frames {b} bytes\n", peers.get(slot).cloned().unwrap_or(slot.to_string()))).collect();
+                let _ = std::fs::write(dbg.with_file_name("txdebug.out"), text);
+            }
             last_status = Instant::now();
             print_peers(&ep, streams.len(), clock(start));
             if ckr_stats != (0, 0) {
@@ -3075,6 +3129,8 @@ thread_local! {
     static PEER_TX: std::cell::RefCell<HashMap<usize, u64>> = std::cell::RefCell::new(HashMap::new());
     /// Peer writes gathered during one loop pass (see `flush_peers`).
     static PEER_OUT: std::cell::RefCell<HashMap<usize, Vec<u8>>> = std::cell::RefCell::new(HashMap::new());
+    static TX_DEBUG_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TX_DEBUG: std::cell::RefCell<HashMap<(usize, u8), (u64, u64)>> = std::cell::RefCell::new(HashMap::new());
 }
 
 /// Per-peer traffic of the current session on a slot, for `/api/peers`.

@@ -96,6 +96,8 @@ const PATH_TIMEOUT_MS: u64 = 60_000;
 
 /// Minimum interval between path lookups to the same destination.
 const PATH_THROTTLE_MS: u64 = 5_000;
+/// Lookups for a destination without a known path: at most one per this interval.
+const LOOKUP_RETRY_MS: u64 = 1_000;
 
 /// Maximum payloads parked while waiting for path discovery.
 const MAX_PENDING_TRAFFIC: usize = 4;
@@ -116,6 +118,8 @@ pub struct YggdrasilLite {
 
     peers: PeerManager,
     tree: LeafTree,
+    /// `addr_for_key` of our key.
+    our_address: Address,
     blooms: LeafBlooms,
     pathfinder: LeafPathfinder,
     sessions: SessionManager,
@@ -152,6 +156,7 @@ impl YggdrasilLite {
                 config.max_paths,
             ),
             tree: LeafTree::new(crypto.public_key),
+            our_address: address::addr_for_key(&crypto.public_key),
             sessions: SessionManager::new(),
             peers: PeerManager::new(),
             pending_traffic: Vec::new(),
@@ -174,9 +179,9 @@ impl YggdrasilLite {
         &self.crypto.public_key
     }
 
-    /// Our `200::/7` IPv6 address (16 bytes).
+    /// Our `200::/7` IPv6 address (16 bytes), computed once (it is checked per packet).
     pub fn address(&self) -> Address {
-        address::addr_for_key(&self.crypto.public_key)
+        self.our_address
     }
 
     /// Our `300::/7` subnet prefix (first 8 bytes of the /64).
@@ -677,7 +682,9 @@ impl YggdrasilLite {
         events.extend(self.session_actions_to_events(dest, session_actions));
 
         // If we don't have a path yet, initiate lookup
-        if !self.pathfinder.has_path(dest) {
+        // A direct peer needs no lookup: its traffic goes straight to it (see route_to_dest).
+        let direct = self.peers.iter().any(|p| p.handshake_done && p.key == *dest) && self.tree.has_info(dest);
+        if !self.pathfinder.has_path(dest) && !direct {
             events.extend(self.initiate_path_lookup(dest, now_ms));
         }
 
@@ -730,6 +737,15 @@ impl YggdrasilLite {
         {
             return Vec::new();
         }
+        // Without a path there is no path entry to throttle on: the rumor keeps the time of
+        // the last lookup instead. Without this every packet sent meanwhile started a lookup
+        // (a flood to all matching peers, ~1000/s under load).
+        let xformed = bloom_transform(*dest);
+        if !self.pathfinder.has_path(dest)
+            && self.pathfinder.should_throttle_rumor(&xformed, now_ms, LOOKUP_RETRY_MS)
+        {
+            return Vec::new();
+        }
 
         self.pathfinder.mark_lookup_sent(dest, now_ms);
 
@@ -737,8 +753,8 @@ impl YggdrasilLite {
         // PathNotify reply is accepted. The transform is identical for the
         // partial key derived from an address and the responder's full key,
         // which is what lets address-initiated lookups resolve to a full key.
-        self.pathfinder
-            .ensure_rumor(bloom_transform(*dest), now_ms);
+        self.pathfinder.ensure_rumor(xformed, now_ms);
+        self.pathfinder.mark_rumor_sent(&xformed, now_ms);
 
         let our_coords = self.tree.get_coords();
         let lookup = wire::PathLookup {
@@ -951,6 +967,12 @@ impl YggdrasilLite {
         }
     }
 
+    /// Wall-clock time (ms) at which this node's `now_ms` was zero: makes session init
+    /// sequence numbers survive a restart (see `SessionManager::set_seq_base`).
+    pub fn set_clock_base(&mut self, unix_ms: u64) {
+        self.sessions.set_seq_base(unix_ms);
+    }
+
     /// Peers not to take as tree parent while another peer reaches the same root, e.g. an exit
     /// that does not forward: under it nobody could reach us through the tree.
     pub fn set_avoid_parents(&mut self, keys: &[PublicKey]) {
@@ -1039,9 +1061,14 @@ impl YggdrasilLite {
     /// route the packet toward the tree root, bypassing bloom-gated
     /// discovery — and with it the no_redistribute policy of transit nodes.
     fn route_to_dest(&mut self, dest: &PublicKey, payload: Vec<u8>) -> Option<NodeEvent> {
-        // Get destination coordinates from pathfinder
+        // A direct peer: straight to it, whatever the tree says (a cached path can be stale
+        // after it moved in the tree, and then a public peer looks "closer" — the traffic
+        // would cross the network instead of the one link).
+        let direct = self.peers.iter().find(|p| p.handshake_done && p.key == *dest).map(|p| p.id);
+        // Get destination coordinates from pathfinder (for a direct peer, its own coords will do)
         let dest_path = match self.pathfinder.get_path_for_traffic(dest) {
             Some(p) => p.to_vec(),
+            None if direct.is_some() && self.tree.has_info(dest) => self.tree.get_root_and_path(dest).1,
             None => {
                 // Keep only the newest payload per destination (pre-session
                 // this is the handshake init, which is safe to replace).
@@ -1057,7 +1084,7 @@ impl YggdrasilLite {
         // Find next hop by greedy tree routing, recording our distance in the
         // watermark so downstream transit nodes enforce monotonic progress.
         let mut watermark = u64::MAX;
-        let next_hop = match self.lookup_next_hop(&dest_path, &mut watermark) {
+        let next_hop = match direct.or_else(|| self.lookup_next_hop(&dest_path, &mut watermark)) {
             Some(id) => id,
             None => {
                 // No peer is closer — send to the first connected peer as a

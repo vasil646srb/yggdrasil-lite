@@ -522,6 +522,10 @@ pub struct SessionManager {
     buffers: Vec<(PublicKey, SessionBuffer)>,
     max_sessions: usize,
     max_buffers: usize,
+    /// Added to `now_tick` for the `seq` of our inits/acks. The remote takes an init only
+    /// when its `seq` is higher than the last one, so with a clock that starts at zero on
+    /// every start a restarted node could never renew its sessions (see `set_seq_base`).
+    seq_base: u64,
 }
 
 impl SessionManager {
@@ -531,7 +535,15 @@ impl SessionManager {
             buffers: Vec::new(),
             max_sessions: DEFAULT_MAX_SESSIONS,
             max_buffers: DEFAULT_MAX_BUFFERS,
+            seq_base: 0,
         }
+    }
+
+    /// Base for init `seq` values: the wall-clock time (ms) at which `now_tick` was zero, as
+    /// Yggdrasil uses wall-clock time. Then a restarted node's inits are newer than the ones
+    /// its peers remember, and their sessions recover at once.
+    pub fn set_seq_base(&mut self, base_ms: u64) {
+        self.seq_base = base_ms;
     }
 
     /// Number of active sessions.
@@ -631,6 +643,7 @@ impl SessionManager {
         now_tick: u64,
         rng: &mut impl CryptoRngCore,
     ) -> Vec<SessionAction> {
+        let seq_base = self.seq_base;
         let mut actions = Vec::new();
         let had_session = self.has_session(from);
 
@@ -652,7 +665,7 @@ impl SessionManager {
             }
 
             // Send ack
-            let ack = SessionInit::new(&info.send_pub, &info.next_pub, info.local_key_seq, now_tick);
+            let ack = SessionInit::new(&info.send_pub, &info.next_pub, info.local_key_seq, seq_base + now_tick);
             if let Ok(data) = ack.encrypt(our_ed_priv, from, SESSION_TYPE_ACK, rng) {
                 actions.push(SessionAction::SendToRemote {
                     dest: *from,
@@ -722,6 +735,7 @@ impl SessionManager {
         now_tick: u64,
         rng: &mut impl CryptoRngCore,
     ) -> Vec<SessionAction> {
+        let seq_base = self.seq_base;
         let mut actions = Vec::new();
 
         if let Some(info) = self.get_session_mut(from) {
@@ -737,7 +751,7 @@ impl SessionManager {
                         &info.send_pub,
                         &info.next_pub,
                         info.local_key_seq,
-                        now_tick,
+                        seq_base + now_tick,
                     );
                     if let Ok(data) = init.encrypt(our_ed_priv, from, SESSION_TYPE_INIT, rng) {
                         actions.push(SessionAction::SendToRemote {
@@ -752,7 +766,7 @@ impl SessionManager {
             // Unknown sender: send ephemeral init
             let (cp, _) = new_box_keys(rng);
             let (np, _) = new_box_keys(rng);
-            let init = SessionInit::new(&cp, &np, 0, now_tick);
+            let init = SessionInit::new(&cp, &np, 0, seq_base + now_tick);
             if let Ok(data) = init.encrypt(our_ed_priv, from, SESSION_TYPE_INIT, rng) {
                 actions.push(SessionAction::SendToRemote {
                     dest: *from,
@@ -821,7 +835,7 @@ impl SessionManager {
                 *dest,
                 SessionBuffer {
                     data: None,
-                    init: SessionInit::new(&current_pub, &next_pub, 0, now_tick),
+                    init: SessionInit::new(&current_pub, &next_pub, 0, self.seq_base + now_tick),
                     current_priv,
                     next_priv,
                     created_tick: now_tick,
