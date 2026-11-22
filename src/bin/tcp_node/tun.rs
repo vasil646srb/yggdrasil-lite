@@ -24,6 +24,35 @@ fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Packets the kernel holds for us on the interface (default 500). When the node falls behind
+/// (a slow CPU), these wait first-in first-out and are dropped only when the ring is full:
+/// 500 packets are 0.3 s of delay at 20 Mbit/s for everything in the tunnel; 128 drop sooner,
+/// so TCP inside slows down instead.
+#[cfg(target_os = "linux")]
+const TUN_TXQUEUELEN: libc::c_int = 128;
+
+/// `ip link set NAME txqueuelen N`, best effort.
+#[cfg(target_os = "linux")]
+fn set_txqueuelen(name: &str, len: libc::c_int) {
+    const SIOCSIFTXQLEN: libc::c_ulong = 0x8943;
+    #[repr(C)]
+    struct IfReqQlen {
+        name: [u8; 16],
+        qlen: libc::c_int,
+        _pad: [u8; 20],
+    }
+    let mut req = IfReqQlen { name: [0; 16], qlen: len, _pad: [0; 20] };
+    req.name[..name.len()].copy_from_slice(name.as_bytes());
+    // SAFETY: a plain socket for the ioctl, closed right after; the ioctl reads an ifreq we own.
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        if fd >= 0 {
+            libc::ioctl(fd, SIOCSIFTXQLEN as _, &mut req);
+            libc::close(fd);
+        }
+    }
+}
+
 impl Tun {
     /// Create or attach Linux TUN interface `name` (IFF_TUN | IFF_NO_PI). Needs CAP_NET_ADMIN;
     /// the caller configures the address and routes (`ip -6 addr add <our address>/7 dev NAME`).
@@ -49,6 +78,7 @@ impl Tun {
             return Err(std::io::Error::last_os_error());
         }
         set_nonblocking(file.as_raw_fd())?;
+        set_txqueuelen(name, TUN_TXQUEUELEN);
         Ok(Tun { file, _ctl: None })
     }
 

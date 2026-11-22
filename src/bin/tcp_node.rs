@@ -1361,9 +1361,44 @@ impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Stream::Plain(s) => s.read(buf),
+            // Not `StreamOwned::read`: it first writes out whatever TLS data waits, blocking, and
+            // peer writes must never block the loop (see `PeerOut`).
             #[cfg(feature = "upstream-tls")]
-            Stream::Tls(s) => s.read(buf),
+            Stream::Tls(s) => loop {
+                match s.conn.reader().read(buf) {
+                    Ok(n) => return Ok(n),
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                    Err(e) => return Err(e),
+                }
+                if s.conn.read_tls(&mut s.sock)? == 0 {
+                    return Ok(0);
+                }
+                s.conn.process_new_packets().map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
+            },
         }
+    }
+}
+
+/// Send without blocking (Unix: `MSG_DONTWAIT`, whatever the socket's mode). Windows has no
+/// per-call flag: there the write blocks up to the socket's write timeout, as it always did.
+#[cfg(unix)]
+fn send_nb(fd: RawFd, buf: &[u8]) -> std::io::Result<usize> {
+    // SAFETY: `buf` is valid for `len` bytes for the duration of the call.
+    let r = unsafe { libc::send(fd, buf.as_ptr() as *const libc::c_void, buf.len(), libc::MSG_DONTWAIT) };
+    if r < 0 { Err(std::io::Error::last_os_error()) } else { Ok(r as usize) }
+}
+
+/// `Write` over [`send_nb`], for rustls to push its records through.
+#[cfg(all(unix, feature = "upstream-tls"))]
+struct NbWriter(RawFd);
+
+#[cfg(all(unix, feature = "upstream-tls"))]
+impl Write for NbWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        send_nb(self.0, buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -1385,6 +1420,74 @@ impl Write for Stream {
 }
 
 impl Stream {
+    /// Write some of `buf` without blocking; `WouldBlock` when the socket takes nothing now.
+    fn send_some(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Records rustls already holds go first; new data only once they are out, so the queue
+        // (and its drop rule) stays in `PeerOut`, not inside rustls.
+        self.flush_tls()?;
+        match self {
+            #[cfg(unix)]
+            Stream::Plain(s) => send_nb(s.as_raw_fd(), buf),
+            #[cfg(not(unix))]
+            Stream::Plain(s) => s.write(buf),
+            #[cfg(feature = "upstream-tls")]
+            Stream::Tls(s) => {
+                let n = s.conn.writer().write(buf)?;
+                match self.flush_tls() {
+                    Err(e) if e.kind() != ErrorKind::WouldBlock => Err(e),
+                    _ => Ok(n),
+                }
+            }
+        }
+    }
+
+    /// Push out TLS records rustls holds, without blocking (plain TCP: nothing to do).
+    /// `WouldBlock` while some are left.
+    fn flush_tls(&mut self) -> std::io::Result<()> {
+        #[cfg(feature = "upstream-tls")]
+        if let Stream::Tls(s) = self {
+            #[cfg(unix)]
+            let mut w = NbWriter(s.sock.as_raw_fd());
+            #[cfg(not(unix))]
+            let mut w = &mut s.sock;
+            while s.conn.wants_write() {
+                if s.conn.write_tls(&mut w)? == 0 {
+                    return Err(ErrorKind::WriteZero.into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// rustls holds records that did not fit into the socket yet.
+    fn tls_pending(&self) -> bool {
+        match self {
+            Stream::Plain(_) => false,
+            #[cfg(feature = "upstream-tls")]
+            Stream::Tls(s) => s.conn.wants_write(),
+        }
+    }
+
+    /// Peer socket options: the kernel keeps little unsent data, so the backlog builds up in
+    /// `PeerOut`, where bulk traffic can be dropped (Linux and Android).
+    fn tune(&self) {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            const TCP_NOTSENT_LOWAT: libc::c_int = 25;
+            let v: libc::c_int = PEER_KERNEL_UNSENT as libc::c_int;
+            // SAFETY: setsockopt reads one int from `v`.
+            unsafe {
+                libc::setsockopt(
+                    self.raw_fd(),
+                    libc::IPPROTO_TCP,
+                    TCP_NOTSENT_LOWAT,
+                    &v as *const libc::c_int as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+    }
+
     fn raw_fd(&self) -> RawFd {
         match self {
             Stream::Plain(s) => s.as_raw_fd(),
@@ -1622,13 +1725,14 @@ fn run(actions: Vec<Action>, ep: &mut Endpoint, streams: &mut HashMap<usize, Str
                 if streams.contains_key(&slot) {
                     PEER_TX.with(|m| *m.borrow_mut().entry(slot).or_default() += data.len() as u64);
                     tx_debug(slot, &data);
-                    // Gathered and written once per loop pass (see `flush_peers`): one system
-                    // call and a few full TCP segments instead of one per packet.
                     let full = PEER_OUT.with(|m| {
                         let mut m = m.borrow_mut();
-                        let b = m.entry(slot).or_default();
-                        b.extend_from_slice(&data);
-                        b.len() >= PEER_OUT_MAX
+                        let q = m.entry(slot).or_default();
+                        if !q.push(data) {
+                            PEER_DROPPED.with(|c| c.set(c.get() + 1));
+                            return false;
+                        }
+                        q.unwritten() >= PEER_OUT_MAX
                     });
                     if full {
                         flush_slot(slot, ep, streams, now);
@@ -1666,42 +1770,184 @@ fn tx_debug(slot: usize, data: &[u8]) {
     });
 }
 
-/// Bytes gathered for one peer before they are written right away.
+/// Bytes waiting for one peer before a write is tried right away (otherwise once per loop pass,
+/// see `flush_peers`): one system call and full TCP segments instead of one per packet.
 const PEER_OUT_MAX: usize = 16 * 1024;
+/// While a peer's socket is full, bulk traffic is dropped once the oldest queued frame has
+/// waited this long. Blocking writes used to stop the whole node while one peer's link was full
+/// (pings, other peers and clients all waited), and the kernel buffered megabytes meanwhile:
+/// nothing was ever dropped, so TCP inside the tunnel (the speed test, CKR downloads) kept
+/// speeding up until a whole window sat in the queue (+0.5 s of ping at 15 Mbit/s). A drop
+/// tells it to slow down instead; yggdrasil-go drops in its peer queues the same way. A delay
+/// rather than a size: the same bytes are 4 ms at 100 Mbit/s and 100 ms at 4 Mbit/s.
+const PEER_QUEUE_DELAY: Duration = Duration::from_millis(20);
+/// Traffic queued for one peer above which bulk frames are dropped whatever their wait.
+const PEER_QUEUE_MAX: usize = 512 * 1024;
+/// Unsent bytes the kernel may hold per peer socket (TCP_NOTSENT_LOWAT), on top of what is in
+/// flight.
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
+const PEER_KERNEL_UNSENT: usize = 16 * 1024;
+/// Traffic frames shorter than this (pings, TCP ACKs, DNS) are never dropped.
+const BULK_FRAME: usize = 256;
+/// A peer whose queue makes no progress this long is closed (the old blocking write's timeout).
+const PEER_WRITE_STALL: Duration = Duration::from_secs(5);
 
-/// Write what [`run`] gathered for `slot`.
-fn flush_slot(slot: usize, ep: &mut Endpoint, streams: &mut HashMap<usize, Stream>, now: u64) {
-    // The buffer goes back into the map afterwards: its memory is reused for the next pass.
-    let Some(mut data) = PEER_OUT.with(|m| m.borrow_mut().get_mut(&slot).map(std::mem::take)) else { return };
-    if data.is_empty() {
-        return;
+const TRAFFIC_FRAME: u8 = yggdrasil_lite::wire::PacketType::Traffic as u8;
+
+/// Frame type: uvarint length, then the type byte.
+fn frame_type(data: &[u8]) -> Option<u8> {
+    let mut i = 0;
+    while i < data.len() && data[i] & 0x80 != 0 {
+        i += 1;
     }
-    let mut closed = false;
-    if let Some(s) = streams.get_mut(&slot) {
-        if let Err(e) = s.write_all(&data) {
-            eprintln!("write to slot {slot} failed: {e} ({:?})", e.kind());
-            streams.remove(&slot);
-            ep.on_transport_closed(slot, now);
-            closed = true;
-        }
-    }
-    data.clear();
-    PEER_OUT.with(|m| {
-        let mut m = m.borrow_mut();
-        if closed || !streams.contains_key(&slot) {
-            m.remove(&slot);
-        } else {
-            m.insert(slot, data);
-        }
-    });
+    data.get(i + 1).copied()
 }
 
-/// Write everything gathered for the peers (before the loop waits).
+/// What waits to be written to one peer. Writes never block: the socket takes what it can and
+/// the rest waits here for the next pass (or for poll to report the socket writable).
+#[derive(Default)]
+struct PeerOut {
+    /// Whole frames being written; the first `off` bytes are out.
+    cur: Vec<u8>,
+    off: usize,
+    /// Protocol frames (tree, path lookups): they may pass queued traffic.
+    proto: VecDeque<Vec<u8>>,
+    proto_bytes: usize,
+    /// Traffic frames with the time they were queued, kept in order: a session drops a nonce
+    /// older than the last one it saw.
+    traffic: VecDeque<(Vec<u8>, Instant)>,
+    traffic_bytes: usize,
+    /// The socket refused data on the last try (the link is the bottleneck now).
+    full: bool,
+    /// Since when data waits without any byte going out.
+    stalled_since: Option<Instant>,
+}
+
+impl PeerOut {
+    /// Queue a frame; false if it is bulk traffic and the queue is full (dropped).
+    fn push(&mut self, data: Vec<u8>) -> bool {
+        if frame_type(&data) == Some(TRAFFIC_FRAME) {
+            if data.len() >= BULK_FRAME && self.over_limit() {
+                return false;
+            }
+            self.traffic_bytes += data.len();
+            self.traffic.push_back((data, Instant::now()));
+        } else {
+            self.proto_bytes += data.len();
+            self.proto.push_back(data);
+        }
+        true
+    }
+
+    /// Bulk traffic must be dropped now: the socket is full and the queue waits too long.
+    fn over_limit(&self) -> bool {
+        if self.traffic_bytes + self.cur.len() - self.off > PEER_QUEUE_MAX {
+            return true;
+        }
+        self.full && self.traffic.front().is_some_and(|(_, t)| t.elapsed() > PEER_QUEUE_DELAY)
+    }
+
+    fn unwritten(&self) -> usize {
+        self.cur.len() - self.off + self.traffic_bytes + self.proto_bytes
+    }
+
+    fn is_empty(&self) -> bool {
+        self.off == self.cur.len() && self.proto.is_empty() && self.traffic.is_empty()
+    }
+
+    /// Move whole frames into `cur` (protocol frames first), up to a few writes' worth.
+    fn refill(&mut self) {
+        if self.off == self.cur.len() {
+            self.cur.clear();
+            self.off = 0;
+        } else if self.off >= PEER_OUT_MAX {
+            self.cur.drain(..self.off);
+            self.off = 0;
+        }
+        while self.cur.len() - self.off < 4 * PEER_OUT_MAX {
+            let f = if let Some(f) = self.proto.pop_front() {
+                self.proto_bytes -= f.len();
+                f
+            } else if let Some((f, _)) = self.traffic.pop_front() {
+                self.traffic_bytes -= f.len();
+                f
+            } else {
+                break;
+            };
+            self.cur.extend_from_slice(&f);
+        }
+    }
+
+    /// Write what the socket takes now. Err: the connection failed or stalled.
+    fn write_to(&mut self, s: &mut Stream) -> std::io::Result<()> {
+        let mut progress = false;
+        loop {
+            self.refill();
+            if self.off == self.cur.len() {
+                match s.flush_tls() {
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => self.full = true,
+                    Err(e) => return Err(e),
+                    Ok(()) => self.full = false,
+                }
+                break;
+            }
+            match s.send_some(&self.cur[self.off..]) {
+                Ok(0) => return Err(ErrorKind::WriteZero.into()),
+                Ok(n) => {
+                    self.off += n;
+                    progress = true;
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    self.full = true;
+                    break;
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => break,
+                Err(e) => return Err(e),
+            }
+        }
+        if progress || (self.is_empty() && !s.tls_pending()) {
+            self.stalled_since = None;
+        } else {
+            let since = *self.stalled_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= PEER_WRITE_STALL {
+                return Err(std::io::Error::new(ErrorKind::TimedOut, "no write progress for 5 s"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Write what waits for `slot`, as much as its socket takes now.
+fn flush_slot(slot: usize, ep: &mut Endpoint, streams: &mut HashMap<usize, Stream>, now: u64) {
+    let Some(s) = streams.get_mut(&slot) else {
+        PEER_OUT.with(|m| m.borrow_mut().remove(&slot));
+        return;
+    };
+    let r = PEER_OUT.with(|m| m.borrow_mut().get_mut(&slot).map_or(Ok(()), |q| q.write_to(s)));
+    if let Err(e) = r {
+        eprintln!("write to slot {slot} failed: {e} ({:?})", e.kind());
+        streams.remove(&slot);
+        PEER_OUT.with(|m| m.borrow_mut().remove(&slot));
+        ep.on_transport_closed(slot, now);
+    }
+}
+
+/// Write what waits for the peers (several times a pass, and before the loop waits).
 fn flush_peers(ep: &mut Endpoint, streams: &mut HashMap<usize, Stream>, now: u64) {
-    let slots: Vec<usize> = PEER_OUT.with(|m| m.borrow().iter().filter(|(_, b)| !b.is_empty()).map(|(s, _)| *s).collect());
+    let mut slots: Vec<usize> = PEER_OUT.with(|m| m.borrow().iter().filter(|(_, q)| !q.is_empty()).map(|(s, _)| *s).collect());
+    // TLS records left over from a pass with nothing else queued.
+    slots.extend(streams.iter().filter(|(k, s)| s.tls_pending() && !slots.contains(k)).map(|(k, _)| *k).collect::<Vec<_>>());
     for slot in slots {
+        PEER_OUT.with(|m| {
+            m.borrow_mut().entry(slot).or_default();
+        });
         flush_slot(slot, ep, streams, now);
     }
+}
+
+/// A peer has data waiting for its socket: poll it for writability too.
+fn peer_wants_write(slot: usize, s: &Stream) -> bool {
+    s.tls_pending() || PEER_OUT.with(|m| m.borrow().get(&slot).is_some_and(|q| !q.is_empty()))
 }
 
 /// Deliver one overlay UDP datagram to the local service mapped to its destination port.
@@ -2049,6 +2295,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             activity = true;
             match done.stream {
                 Some(stream) => {
+                    stream.tune();
                     streams.insert(done.slot, stream);
                     let acts = ep.on_transport_up(done.slot, now);
                     run(acts, &mut ep, &mut streams, &mut dialer, now);
@@ -2099,7 +2346,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
                 let _ = stream.set_read_timeout(Some(Duration::from_millis(1)));
                 let (slot, acts) = ep.accept_transport(now);
-                streams.insert(slot, Stream::Plain(stream));
+                let stream = Stream::Plain(stream);
+                stream.tune();
+                streams.insert(slot, stream);
                 run(acts, &mut ep, &mut streams, &mut dialer, now);
                 println!("inbound from {from}");
             }
@@ -2914,6 +3163,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let _ = std::fs::write(dbg.with_file_name("txdebug.out"), text);
             }
             last_status = Instant::now();
+            let dropped = PEER_DROPPED.with(|c| c.replace(0));
+            if dropped > 0 {
+                println!("peer queue full: dropped {dropped} bulk packets in 10 s");
+            }
             print_peers(&ep, streams.len(), clock(start));
             if ckr_stats != (0, 0) {
                 println!("ckr:            refused {} packet(s) from keys without access, {} malformed or from a foreign address", ckr_stats.0, ckr_stats.1);
@@ -2957,7 +3210,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         };
         poller.clear();
         let stream_idx: Vec<(usize, usize)> =
-            streams.iter().map(|(slot, s)| (*slot, poller.add(s.raw_fd(), sys::IN))).collect();
+            streams.iter().map(|(slot, s)| (*slot, poller.add(s.raw_fd(), if peer_wants_write(*slot, s) { sys::IN | sys::OUT } else { sys::IN }))).collect();
         if let Some(l) = listener.as_ref() {
             poller.add(l.as_raw_fd(), sys::IN);
         }
@@ -3128,7 +3381,9 @@ thread_local! {
     static PEER_RX: std::cell::RefCell<HashMap<usize, u64>> = std::cell::RefCell::new(HashMap::new());
     static PEER_TX: std::cell::RefCell<HashMap<usize, u64>> = std::cell::RefCell::new(HashMap::new());
     /// Peer writes gathered during one loop pass (see `flush_peers`).
-    static PEER_OUT: std::cell::RefCell<HashMap<usize, Vec<u8>>> = std::cell::RefCell::new(HashMap::new());
+    static PEER_OUT: std::cell::RefCell<HashMap<usize, PeerOut>> = std::cell::RefCell::new(HashMap::new());
+    /// Bulk traffic frames dropped because their peer's queue was full.
+    static PEER_DROPPED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static TX_DEBUG_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static TX_DEBUG: std::cell::RefCell<HashMap<(usize, u8), (u64, u64)>> = std::cell::RefCell::new(HashMap::new());
 }
