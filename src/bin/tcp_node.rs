@@ -1773,16 +1773,22 @@ fn tx_debug(slot: usize, data: &[u8]) {
 /// Bytes waiting for one peer before a write is tried right away (otherwise once per loop pass,
 /// see `flush_peers`): one system call and full TCP segments instead of one per packet.
 const PEER_OUT_MAX: usize = 16 * 1024;
-/// While a peer's socket is full, bulk traffic is dropped once the oldest queued frame has
-/// waited this long. Blocking writes used to stop the whole node while one peer's link was full
+/// While a peer's socket is full and the oldest queued frame has waited longer than this for a
+/// whole `PEER_QUEUE_INTERVAL`, bulk traffic starts to be dropped, CoDel-style: one frame, then
+/// more often while the delay stays (interval / sqrt(drops)). Single drops are what TCP repairs
+/// quickly; dropping everything over the limit made the node's own TCP (the speed test) lose
+/// dozens of segments per window and crawl at 1–2 Mbit/s. Blocking writes used to stop the whole node while one peer's link was full
 /// (pings, other peers and clients all waited), and the kernel buffered megabytes meanwhile:
 /// nothing was ever dropped, so TCP inside the tunnel (the speed test, CKR downloads) kept
 /// speeding up until a whole window sat in the queue (+0.5 s of ping at 15 Mbit/s). A drop
 /// tells it to slow down instead; yggdrasil-go drops in its peer queues the same way. A delay
 /// rather than a size: the same bytes are 4 ms at 100 Mbit/s and 100 ms at 4 Mbit/s.
 const PEER_QUEUE_DELAY: Duration = Duration::from_millis(20);
-/// Traffic queued for one peer above which bulk frames are dropped whatever their wait.
-const PEER_QUEUE_MAX: usize = 512 * 1024;
+const PEER_QUEUE_INTERVAL: Duration = Duration::from_millis(100);
+/// Memory guard: traffic queued for one peer above which bulk frames are dropped whatever their
+/// wait. Far above what the delay rule lets build up; a drop of everything over a lower cap hit
+/// whole bursts at once, which TCP without SACK repairs one hole per round trip.
+const PEER_QUEUE_MAX: usize = 4 * 1024 * 1024;
 /// Unsent bytes the kernel may hold per peer socket (TCP_NOTSENT_LOWAT), on top of what is in
 /// flight.
 #[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
@@ -1819,6 +1825,13 @@ struct PeerOut {
     traffic_bytes: usize,
     /// The socket refused data on the last try (the link is the bottleneck now).
     full: bool,
+    /// CoDel state: when the delay has been over the target for an interval, whether frames are
+    /// being dropped, when the next drop is due, drops in this episode and when the last ended.
+    above_until: Option<Instant>,
+    dropping: bool,
+    drop_next: Option<Instant>,
+    drops: u32,
+    dropping_ended: Option<Instant>,
     /// Since when data waits without any byte going out.
     stalled_since: Option<Instant>,
 }
@@ -1827,7 +1840,7 @@ impl PeerOut {
     /// Queue a frame; false if it is bulk traffic and the queue is full (dropped).
     fn push(&mut self, data: Vec<u8>) -> bool {
         if frame_type(&data) == Some(TRAFFIC_FRAME) {
-            if data.len() >= BULK_FRAME && self.over_limit() {
+            if data.len() >= BULK_FRAME && self.should_drop() {
                 return false;
             }
             self.traffic_bytes += data.len();
@@ -1839,12 +1852,45 @@ impl PeerOut {
         true
     }
 
-    /// Bulk traffic must be dropped now: the socket is full and the queue waits too long.
-    fn over_limit(&self) -> bool {
+    /// Drop this bulk frame (see `PEER_QUEUE_DELAY`).
+    fn should_drop(&mut self) -> bool {
         if self.traffic_bytes + self.cur.len() - self.off > PEER_QUEUE_MAX {
             return true;
         }
-        self.full && self.traffic.front().is_some_and(|(_, t)| t.elapsed() > PEER_QUEUE_DELAY)
+        let now = Instant::now();
+        let delayed = self.full && self.traffic.front().is_some_and(|(_, t)| now.duration_since(*t) > PEER_QUEUE_DELAY);
+        if !delayed {
+            self.above_until = None;
+            if self.dropping {
+                self.dropping = false;
+                self.dropping_ended = Some(now);
+            }
+            return false;
+        }
+        let gap = |n: u32| PEER_QUEUE_INTERVAL.div_f64((n.max(1) as f64).sqrt());
+        if self.dropping {
+            if self.drop_next.is_some_and(|t| now >= t) {
+                self.drops += 1;
+                self.drop_next = Some(now + gap(self.drops));
+                return true;
+            }
+            return false;
+        }
+        match self.above_until {
+            None => {
+                self.above_until = Some(now + PEER_QUEUE_INTERVAL);
+                false
+            }
+            Some(t) if now >= t => {
+                // Back soon after the last episode: resume near its drop rate (as CoDel does).
+                let recent = self.dropping_ended.is_some_and(|e| now.duration_since(e) < 16 * PEER_QUEUE_INTERVAL);
+                self.drops = if recent { self.drops.saturating_sub(2).max(1) } else { 1 };
+                self.dropping = true;
+                self.drop_next = Some(now + gap(self.drops));
+                true
+            }
+            Some(_) => false,
+        }
     }
 
     fn unwritten(&self) -> usize {
@@ -1864,7 +1910,7 @@ impl PeerOut {
             self.cur.drain(..self.off);
             self.off = 0;
         }
-        while self.cur.len() - self.off < 4 * PEER_OUT_MAX {
+        while self.cur.len() - self.off < 2 * PEER_OUT_MAX {
             let f = if let Some(f) = self.proto.pop_front() {
                 self.proto_bytes -= f.len();
                 f

@@ -58,6 +58,8 @@ pub const KEEPALIVE_IDLE_MS: u64 = 120_000;
 pub const KEEPALIVE_INTERVAL_MS: u64 = 15_000;
 /// Unanswered keepalive probes before the connection is reset.
 pub const KEEPALIVE_PROBES: u32 = 8;
+/// Slow start is not ended by delay below this many segments (HyStart's low window).
+const HYSTART_MIN_CWND: u32 = 16;
 /// Upper bound for the congestion window.
 const CWND_MAX: u32 = 16 * 1024 * 1024;
 /// Out-of-order segments kept per connection.
@@ -218,6 +220,8 @@ struct Tcb {
     // --- RTT and timers ---
     srtt: Option<u64>,
     rttvar: u64,
+    /// Lowest round trip seen: the path without queues (for the slow-start exit).
+    min_rtt: Option<u64>,
     rto: u64,
     /// RTT measurement in progress: (sequence that must be acked, send time).
     rtt_probe: Option<(u32, u64)>,
@@ -1350,6 +1354,7 @@ impl Tcb {
             in_recovery: false,
             recover: iss,
             srtt: None,
+            min_rtt: None,
             rttvar: 0,
             rto: RTO_INIT_MS,
             rtt_probe: None,
@@ -1424,6 +1429,18 @@ impl Tcb {
 
     fn rtt_sample(&mut self, r: u64) {
         let r = r.max(1);
+        let min = *self.min_rtt.get_or_insert(r);
+        self.min_rtt = Some(min.min(r));
+        // Slow start ends when the round trip grows (HyStart, as Linux does): the queue on the
+        // path is filling. Doubling on until a loss sent a whole window (up to 1 MiB) in one
+        // burst; the drops that followed cost one round trip per hole without SACK.
+        let mss = self.mss as u32;
+        if self.cwnd < self.ssthresh && self.cwnd >= HYSTART_MIN_CWND * mss {
+            let eta = (min / 4).clamp(8, 32);
+            if r >= min + eta {
+                self.ssthresh = self.cwnd;
+            }
+        }
         match self.srtt {
             None => {
                 self.srtt = Some(r);
@@ -1459,6 +1476,13 @@ impl Tcb {
         let free = self.rcv_buf.saturating_sub(self.rx.len()) as u32;
         let promised = self.rcv_adv.wrapping_sub(self.rcv_nxt);
         let promised = if (promised as i32) < 0 { 0 } else { promised };
+        // While a hole waits to be filled, keep the right edge where it is: the sender counts an
+        // ACK as a duplicate only if its window is unchanged, and the application reading the
+        // data before the hole would otherwise open the window a little with every ACK. Then
+        // no fast retransmit, and every lost segment cost a retransmission timeout (1 s and up).
+        if !self.ooo.is_empty() && promised > 0 {
+            return promised.min((u16::MAX as u32) << self.rcv_shift);
+        }
         let threshold = (mss as u32).min(self.rcv_buf as u32 / 2);
         let wnd = if free.saturating_sub(promised) < threshold { promised } else { free };
         wnd.min((u16::MAX as u32) << self.rcv_shift)
