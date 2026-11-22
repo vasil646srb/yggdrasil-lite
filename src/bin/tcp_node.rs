@@ -773,6 +773,7 @@ struct Args {
     ckr_tun: Option<String>,
     /// `--ckr-allow-file PATH`: who may use the CKR exit (`*` or Yggdrasil addresses).
     ckr_allow: Option<String>,
+    ckr_no_ipv6: bool,
 }
 
 const USAGE: &str = "usage: tcp_node [options]
@@ -819,6 +820,8 @@ downloads the public peer list and connects.
   --ckr-tun NAME            crypto-key routing exit on Linux TUN NAME (the caller sets up
                             10.77.0.1/16, fd77:7967:6772::1/64, forwarding and NAT)
   --ckr-allow-file PATH     who may use the CKR exit: `*` or Yggdrasil addresses, re-read live
+  --ckr-no-ipv6             the CKR exit has no IPv6 route: clients' IPv6 gets an ICMPv6
+                            no-route error at once (they fall back to IPv4) instead of a silent drop
   --connect-file LPORT:PATH  like --connect, the server ([IPV6]:PORT) read live from PATH:
                             switching servers keeps the node's peers and paths
   --monitor-file PATH       ping the addresses in PATH (one per line, re-read live) and the
@@ -864,7 +867,7 @@ fn parse_connect(spec: &str) -> Result<(u16, Ipv6Addr, u16), String> {
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { key: None, connects: Vec::new(), peers: None, allow: Vec::new(), target: 3, send: None, ping: None, html: None, api: None, html_port: HTML_PORT, quality_ms: DEFAULT_RECHECK_MS, forwards: Vec::new(), open: Vec::new(), proxy_ports: Vec::new(), rtt_limit: CLIENT_RTT_LIMIT_MS, tun: None, tun_ctl: None, tun_server: None, swap_interval: None, swap_settle: None, fwmark: 0, monitor_file: None, connect_file: None, prefer_file: None, search_file: None, socks: None, forwards_udp: Vec::new(), send_udp: None, lan_upstream: false, no_public: false, listen: None, lan_target: None, keep_peers: Vec::new(), server_peers_file: None, ckr_ctl: None, ckr_tun: None, ckr_allow: None };
+    let mut a = Args { key: None, connects: Vec::new(), peers: None, allow: Vec::new(), target: 3, send: None, ping: None, html: None, api: None, html_port: HTML_PORT, quality_ms: DEFAULT_RECHECK_MS, forwards: Vec::new(), open: Vec::new(), proxy_ports: Vec::new(), rtt_limit: CLIENT_RTT_LIMIT_MS, tun: None, tun_ctl: None, tun_server: None, swap_interval: None, swap_settle: None, fwmark: 0, monitor_file: None, connect_file: None, prefer_file: None, search_file: None, socks: None, forwards_udp: Vec::new(), send_udp: None, lan_upstream: false, no_public: false, listen: None, lan_target: None, keep_peers: Vec::new(), server_peers_file: None, ckr_ctl: None, ckr_tun: None, ckr_allow: None, ckr_no_ipv6: false };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         match flag.as_str() {
@@ -970,6 +973,7 @@ fn parse_args() -> Args {
             "--ckr-ctl" => a.ckr_ctl = Some(it.next().unwrap_or_else(|| usage())),
             "--ckr-tun" => a.ckr_tun = Some(it.next().unwrap_or_else(|| usage())),
             "--ckr-allow-file" => a.ckr_allow = Some(it.next().unwrap_or_else(|| usage())),
+            "--ckr-no-ipv6" => a.ckr_no_ipv6 = true,
             "--keep-peer" => {
                 let u = it.next().unwrap_or_else(|| usage());
                 match TcpPeerUri::parse(u.trim()) {
@@ -2284,7 +2288,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             ep.set_ckr_accept(true);
             ep.set_inbox_cap(4096);
             println!("ckr exit:       {name} (clients {}.{}.0.0/16)", ckr::POOL4[0], ckr::POOL4[1]);
-            Some((t, ckr::Exit::new(args.ckr_allow.clone())))
+            if args.ckr_no_ipv6 {
+                println!("ckr exit:       no IPv6: clients' IPv6 gets an ICMPv6 no-route");
+            }
+            Some((t, ckr::Exit::new(args.ckr_allow.clone(), !args.ckr_no_ipv6)))
         }
         None => None,
     };
@@ -2512,6 +2519,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                     let mut pkt = unframe_ipv6(&msg.data).to_vec();
                     match exit.inbound(&msg.from_key, &mut pkt) {
                         ckr::In::Sent => t.write(&pkt),
+                        ckr::In::NoIpv6 => {
+                            if let Some(err) = ckr::unreachable6(&pkt) {
+                                let mut framed = Vec::with_capacity(err.len() + 1);
+                                framed.push(yggdrasil_lite::IPV6_FRAME);
+                                framed.extend_from_slice(&err);
+                                let acts = ep.send_to_key(&msg.from_key, &framed, now, &mut rng);
+                                run(acts, &mut ep, &mut streams, &mut dialer, now);
+                            }
+                        }
                         ckr::In::NotAllowed => ckr_stats.0 += 1,
                         _ => ckr_stats.1 += 1,
                     }

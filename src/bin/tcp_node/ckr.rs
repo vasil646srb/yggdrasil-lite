@@ -44,6 +44,8 @@ pub enum In {
     NotAllowed,
     BadSource,
     Malformed,
+    /// Internet IPv6 while the exit has none: answer with [`unreachable6`].
+    NoIpv6,
 }
 
 pub struct Exit {
@@ -55,12 +57,14 @@ pub struct Exit {
     by_key: HashMap<PublicKey, Slot>,
     by_idx: HashMap<u16, PublicKey>,
     next: u32,
+    /// The exit routes IPv6 to the internet (else IPv6 packets get an ICMPv6 error back).
+    ipv6: bool,
 }
 
 impl Exit {
     /// `allow_path`: one entry per line, re-read every few seconds: `*` (anyone: a public
     /// exit) or Yggdrasil addresses of devices with access. No file: nobody.
-    pub fn new(allow_path: Option<String>) -> Exit {
+    pub fn new(allow_path: Option<String>, ipv6: bool) -> Exit {
         Exit {
             allow_path,
             allow_any: false,
@@ -70,6 +74,7 @@ impl Exit {
             by_key: HashMap::new(),
             by_idx: HashMap::new(),
             next: 0,
+            ipv6,
         }
     }
 
@@ -152,6 +157,9 @@ impl Exit {
                 }
                 if pkt[8..24] != addr_for_key(key).0[..] {
                     return In::BadSource;
+                }
+                if !self.ipv6 {
+                    return In::NoIpv6;
                 }
                 let idx = self.slot(key, None);
                 set_v6_addr(pkt, 8, &pool6(idx));
@@ -365,6 +373,32 @@ fn icmp4_error_inner(pkt: &mut [u8], ihl: usize, pool: &[u8; 4], orig: &[u8; 4])
     pkt[ihl + 2..ihl + 4].copy_from_slice(&c.to_be_bytes());
 }
 
+/// ICMPv6 "no route to destination" for a client's IPv6 packet, from its destination back to
+/// it. An exit without IPv6 used to drop such packets silently: the client's TUN routes all
+/// IPv6, Android then reports IPv6 as working, and apps that try it first (YouTube, Twitch)
+/// waited for their timeouts while the browser fell back to IPv4 at once. The error makes
+/// every client's connect fail right away, and the apps use IPv4.
+pub fn unreachable6(pkt: &[u8]) -> Option<Vec<u8>> {
+    // Never answer an ICMPv6 error (or a packet too short to be IPv6) with another.
+    if pkt.len() < 40 || pkt[0] >> 4 != 6 || (pkt[6] == 58 && pkt.get(40).is_some_and(|t| *t < 128)) {
+        return None;
+    }
+    let quote = &pkt[..pkt.len().min(1280 - 48)];
+    let mut p = vec![0u8; 48 + quote.len()];
+    p[0] = 0x60;
+    p[4..6].copy_from_slice(&((8 + quote.len()) as u16).to_be_bytes());
+    p[6] = 58;
+    p[7] = 64;
+    p[8..24].copy_from_slice(&pkt[24..40]);
+    p[24..40].copy_from_slice(&pkt[8..24]);
+    p[40] = 1; // destination unreachable
+    p[41] = 0; // no route to destination
+    p[48..].copy_from_slice(quote);
+    let c = icmp6_checksum(&p);
+    p[42..44].copy_from_slice(&c.to_be_bytes());
+    Some(p)
+}
+
 /// ICMPv6 errors: the same, with the pseudo-header checksum.
 fn icmp6_error_inner(pkt: &mut [u8], pool: &[u8; 16], ygg: &[u8; 16]) {
     if pkt[6] != 58 || pkt.len() < 40 + 8 + 40 || !matches!(pkt[40], 1..=4) {
@@ -415,6 +449,29 @@ mod tests {
         fold(s) == 0xffff
     }
 
+    #[test]
+    fn ipv6_without_ipv6_exit_gets_an_unreachable() {
+        let k = key(9);
+        let mut e = Exit::new(None, false);
+        e.allow_any = true;
+        let ygg = addr_for_key(&k).0;
+        let mut p = vec![0u8; 60];
+        p[0] = 0x60;
+        p[4..6].copy_from_slice(&20u16.to_be_bytes());
+        p[6] = 6;
+        p[8..24].copy_from_slice(&ygg);
+        p[24] = 0x2a;
+        assert_eq!(e.inbound(&k, &mut p.clone()), In::NoIpv6);
+        let r = unreachable6(&p).unwrap();
+        assert!(l4_ok_v6(&r));
+        assert_eq!(&r[24..40], &ygg[..]);
+        assert_eq!(&r[8..24], &p[24..40]);
+        assert_eq!((r[40], r[41]), (1, 0));
+        assert_eq!(&r[48..], &p[..]);
+        // No error about an error.
+        assert!(unreachable6(&r).is_none());
+    }
+
     fn l4_ok_v6(p: &[u8]) -> bool {
         let body = &p[40..];
         let mut s = sum16(&p[8..40]);
@@ -446,7 +503,7 @@ mod tests {
     }
 
     fn exit_any() -> Exit {
-        let mut e = Exit::new(None);
+        let mut e = Exit::new(None, true);
         e.allow_any = true;
         e.last_read = Some(Instant::now());
         e
@@ -485,7 +542,7 @@ mod tests {
 
     #[test]
     fn closed_exit_and_foreign_ipv6_sources_are_refused() {
-        let mut e = Exit::new(None);
+        let mut e = Exit::new(None, true);
         e.last_read = Some(Instant::now());
         assert_eq!(e.inbound(&key(1), &mut syn4()), In::NotAllowed);
         e.allow.insert(addr_for_key(&key(1)).0);
